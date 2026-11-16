@@ -40,9 +40,10 @@ def build_arg_parser():
              "flattening, default) / max (+ bytecode VM for eligible functions)",
     )
     p.add_argument("--minify", action="store_true", help="also strip layout whitespace in the final output")
-    p.add_argument("--name-style", choices=["confusable", "hex"], default="confusable",
-                    help="confusable: names built from look-alike l/I characters (default). "
-                         "hex: _0x-style names, easier to debug your own output.")
+    p.add_argument("--name-style", choices=["confusable", "hex", "mixed"], default="confusable",
+                    help="confusable: look-alike l/I/1/0/O/o/_ names, varied length (default, "
+                         "hardest to read). mixed: varied a-z/A-Z/0-9 names (busy-looking). "
+                         "hex: _0x-style names, easiest to debug your own output.")
     p.add_argument("--seed", type=int, default=None, help="random seed, for reproducible output")
 
     # individual toggles — override whatever the preset picked

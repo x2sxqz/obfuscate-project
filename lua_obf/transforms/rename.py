@@ -12,18 +12,24 @@ those live in the AST as plain strings, not `Name` nodes, so they're outside
 this pass's reach by construction.
 """
 
+import random
+
 LUA_KEYWORDS = {
     "and", "break", "do", "else", "elseif", "end", "false", "for",
     "function", "if", "in", "local", "nil", "not", "or", "repeat",
     "return", "then", "true", "until", "while", "continue",
 }
 
+# Confusable alphabet: every glyph looks near-identical in common monospace
+# fonts, so names stay painful to read, but mixing in 1/0/O/o/_ and varying
+# the length removes the old monotonous `lIlIlI` repetition.
+_CONF_FIRST = "lIOo_"           # valid identifier start (no digit)
+_CONF_REST = "lI10Oo_"
 
-def confusable_name(n, minlen=8):
-    """Generate a name built only from 'l' and 'I' — visually near-identical
-    in most fonts, which makes renamed code painful to read without tooling."""
-    b = format(n, f"0{minlen}b")
-    return "".join("l" if c == "0" else "I" for c in b)
+# Mixed alphabet: full varied letters/digits, for people who prefer names
+# that look busy and non-repetitive rather than look-alike.
+_MIX_FIRST = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"
+_MIX_REST = _MIX_FIRST + "0123456789"
 
 
 def hex_name(n):
@@ -54,13 +60,35 @@ class Renamer:
         self.counter = 0
         self.style = style
         self.min_len = min_len
+        self.used = set()  # every generated name, to guarantee global uniqueness
+
+    def _gen_candidate(self):
+        if self.style == "mixed":
+            first, rest = _MIX_FIRST, _MIX_REST
+            length = random.randint(max(4, self.min_len - 2), self.min_len + 8)
+        else:  # confusable
+            first, rest = _CONF_FIRST, _CONF_REST
+            length = random.randint(self.min_len, self.min_len + 10)
+        return random.choice(first) + "".join(random.choice(rest) for _ in range(length - 1))
 
     def _fresh(self):
-        n = self.counter
-        self.counter += 1
+        # Names must be globally unique (later passes rely on each local
+        # having a distinct name); the used-set enforces that regardless of
+        # the random variety in length and characters.
         if self.style == "hex":
+            n = self.counter
+            self.counter += 1
             return hex_name(n)
-        return confusable_name(n, self.min_len)
+        for _ in range(10000):
+            name = self._gen_candidate()
+            if name not in self.used and name not in LUA_KEYWORDS:
+                self.used.add(name)
+                return name
+        # Astronomically unlikely fallback: suffix a counter to force uniqueness.
+        name = self._gen_candidate() + str(self.counter)
+        self.counter += 1
+        self.used.add(name)
+        return name
 
     def declare(self, scope, orig):
         new = self._fresh()
