@@ -123,21 +123,15 @@ class EligibilityChecker:
     def _stmt(self, s, scope):
         k = s.kind
         if k == "LocalStmt":
-            # Our stack VM maps each expr 1:1 to its target register with
-            # single-value truncation (exactly matching real Lua when the
-            # counts match); it has no padding/truncation logic for a count
-            # mismatch, so any mismatch at all is disqualifying — not just
-            # the multi-value-spread case.
-            if s.exprs and len(s.exprs) != len(s.names):
-                raise Disqualified()
+            # Mismatched counts and multi-value tails are now handled by the
+            # compiler's _compile_list (nil-pad / truncate / spread), so no
+            # count restriction here.
             for e in s.exprs:
                 self._expr(e, scope)
             for nm in s.names:
                 scope.declare(nm)
             return
         if k == "AssignStmt":
-            if len(s.exprs) != len(s.targets):
-                raise Disqualified()
             for t in s.targets:
                 if t.kind == "Name":
                     if self._resolve(t.name, scope) != "local":
@@ -179,12 +173,9 @@ class EligibilityChecker:
             self._block(s.body, inner)
             return
         if k == "ReturnStmt":
-            if len(s.exprs) > 1:
-                raise Disqualified()
-            if len(s.exprs) == 1:
-                if _has_multivalue_tail(s.exprs[0]):
-                    raise Disqualified()
-                self._expr(s.exprs[0], scope)
+            # Multiple return values and a multi-value tail are now supported.
+            for e in s.exprs:
+                self._expr(e, scope)
             return
         if k == "GenericForStmt":
             # for v1..vn in explist do body end. The VM's iterator setup
@@ -216,7 +207,7 @@ class EligibilityChecker:
         if k in ("Nil", "True", "False", "Number", "String"):
             return
         if k == "Vararg":
-            raise Disqualified()
+            return  # varargs are now supported
         if k == "Name":
             return  # both 'local' and 'free' reads are safe (see class docstring)
         if k == "Paren":
@@ -229,27 +220,21 @@ class EligibilityChecker:
             return
         if k == "Call":
             self._expr(e.func, scope)
-            for i, a in enumerate(e.args):
-                if i == len(e.args) - 1 and _has_multivalue_tail(a):
-                    raise Disqualified()
-                self._expr(a, scope)
+            for a in e.args:
+                self._expr(a, scope)  # multi-value tail now supported
             return
         if k == "MethodCall":
             self._expr(e.obj, scope)
-            for i, a in enumerate(e.args):
-                if i == len(e.args) - 1 and _has_multivalue_tail(a):
-                    raise Disqualified()
+            for a in e.args:
                 self._expr(a, scope)
             return
         if k == "FunctionExpr":
-            raise Disqualified()  # nested closures not modelled
+            raise Disqualified()  # nested closures not modelled (Stage 3)
         if k == "TableExpr":
-            for i, f in enumerate(e.fields):
+            for f in e.fields:
                 if f.ftype == "indexed":
                     self._expr(f.key, scope)
-                if f.ftype == "pos" and i == len(e.fields) - 1 and _has_multivalue_tail(f.value):
-                    raise Disqualified()
-                self._expr(f.value, scope)
+                self._expr(f.value, scope)  # multi-value tail now supported
             return
         if k == "BinOp":
             self._expr(e.left, scope)
@@ -326,7 +311,14 @@ class FuncCompiler:
             self.reg(p)
         self.compile_block(body)
         self.emit("RET0")
-        return self.code, self.consts, self.globals, len(self.regs), list(params)
+        # 4th value is nparams (fixed parameter count), used by the runtime to
+        # split the packed args into registers + the varargs table.
+        return self.code, self.consts, self.globals, len(params)
+
+    @staticmethod
+    def _is_multi(e):
+        """True if `e` can yield more than one value in a tail position."""
+        return e.kind in ("Call", "MethodCall", "Vararg")
 
     def compile_block(self, stmts):
         for s in stmts:
@@ -345,10 +337,7 @@ class FuncCompiler:
         k = s.kind
         if k == "LocalStmt":
             if s.exprs:
-                for e in s.exprs:
-                    self.compile_expr(e)
-                # stack is LIFO (last pushed expr is on top), so pop names
-                # in reverse to match each name with its own expr by position
+                self._compile_list(s.exprs, len(s.names))  # exactly N values on top
                 for nm in reversed(s.names):
                     self.emit("POPREG", self.reg(nm))
             else:
@@ -356,8 +345,7 @@ class FuncCompiler:
                     self.reg(nm)
             return
         if k == "AssignStmt":
-            for e in s.exprs:
-                self.compile_expr(e)
+            self._compile_list(s.exprs, len(s.targets))  # exactly N values on top
             for t in reversed(s.targets):
                 self.compile_store(t)
             return
@@ -471,11 +459,23 @@ class FuncCompiler:
                 self.patch(b, end)
             return
         if k == "ReturnStmt":
-            if s.exprs:
-                self.compile_expr(s.exprs[0])
+            exprs = s.exprs
+            if not exprs:
+                self.emit("RET0")
+            elif len(exprs) == 1 and not self._is_multi(exprs[0]):
+                self.compile_expr(exprs[0])
                 self.emit("RET1")
             else:
-                self.emit("RET0")
+                fixed = exprs[:-1]
+                last = exprs[-1]
+                for e in fixed:
+                    self.compile_expr(e)
+                if self._is_multi(last):
+                    self.compile_expr_multi(last)  # pushes MC values, sets MC
+                    self.emit("RETV", len(fixed))  # returns len(fixed) + MC
+                else:
+                    self.compile_expr(last)
+                    self.emit("RETN", len(exprs))  # returns exactly len(exprs)
             return
         if k == "BreakStmt":
             j = self.emit("JMP", None)
@@ -524,20 +524,107 @@ class FuncCompiler:
     def _compile_call(self, e, nresults):
         """Compile a Call/MethodCall, capturing exactly `nresults` results on
         the stack (nil-padded / truncated). Used where a fixed number of
-        return values is needed, e.g. the iterator setup of a generic-for."""
+        return values is needed, e.g. the iterator setup of a generic-for.
+        Generic-for headers forbid a multi-tail call, so no *V form here."""
+        fixed, has_tail = self._emit_call_args(e)
+        assert not has_tail
+        self.emit("CALLR", fixed, nresults)
+
+    def _emit_call_args(self, e):
+        """Push the callee and its argument list. Returns (fixed, has_tail):
+        `fixed` is the number of plain single-value arguments pushed, and if
+        `has_tail` the last argument was multi-valued (its values are on the
+        stack and MC is set), so total nargs = fixed + MC."""
         if e.kind == "Call":
             self.compile_expr(e.func)
-            for a in e.args:
-                self.compile_expr(a)
-            self.emit("CALLR", len(e.args), nresults)
+            self_extra = 0
         else:  # MethodCall
             self.compile_expr(e.obj)
             self.emit("DUP")
             self.emit("GETFIELDK", self.k(e.method))
-            self.emit("SWAP")
-            for a in e.args:
+            self.emit("SWAP")  # stack: fn, self
+            self_extra = 1
+        args = e.args
+        if args and self._is_multi(args[-1]):
+            for a in args[:-1]:
                 self.compile_expr(a)
-            self.emit("CALLR", len(e.args) + 1, nresults)
+            self.compile_expr_multi(args[-1])  # pushes MC values, sets MC
+            return self_extra + len(args) - 1, True
+        for a in args:
+            self.compile_expr(a)
+        return self_extra + len(args), False
+
+    def _emit_call(self, e, multi):
+        """Emit a call. `multi` selects whether all results stay on the stack
+        (and MC is set) or the call is truncated to a single value."""
+        fixed, has_tail = self._emit_call_args(e)
+        if has_tail:
+            self.emit("CALLVM" if multi else "CALLV", fixed)  # nargs = fixed + MC
+        else:
+            self.emit("CALLM" if multi else "CALL", fixed)
+
+    def _compile_list(self, exprs, n):
+        """Evaluate an expression list and leave EXACTLY `n` values on top of
+        the stack (nil-padded or truncated), applying Lua's rule that only the
+        last expression expands to multiple values."""
+        if not exprs:
+            for _ in range(n):
+                self.emit("PUSHK", self.k(None))
+            return
+        fixed = exprs[:-1]
+        last = exprs[-1]
+        for e in fixed:
+            self.compile_expr(e)
+        if self._is_multi(last):
+            self.compile_expr_multi(last)        # pushes MC values, sets MC
+            self.emit("ADJV", len(fixed), n)     # make exactly n on top
+        else:
+            self.compile_expr(last)
+            total = len(exprs)
+            if total < n:
+                for _ in range(n - total):
+                    self.emit("PUSHK", self.k(None))
+            else:
+                for _ in range(total - n):
+                    self.emit("POP")
+
+    def compile_expr_multi(self, e):
+        """Compile `e` so that ALL its values land on the stack and MC is set
+        to the count. For non-multi expressions this still works via the
+        single-value path with the caller treating it as one fixed value."""
+        if e.kind == "Vararg":
+            self.emit("VARARG")
+        elif e.kind in ("Call", "MethodCall"):
+            self._emit_call(e, multi=True)
+        else:
+            # not actually multi — caller handles it as a single fixed value
+            self.compile_expr(e)
+
+    def _compile_table(self, e):
+        self.emit("NEWTABLE")
+        pos = 1
+        n = len(e.fields)
+        for i, f in enumerate(e.fields):
+            last = i == n - 1
+            if f.ftype == "pos":
+                if last and self._is_multi(f.value):
+                    # table on stack; append all tail values from index `pos`
+                    self.compile_expr_multi(f.value)
+                    self.emit("SETLISTV", pos)
+                else:
+                    self.emit("DUP")
+                    self.compile_expr(f.value)
+                    self.emit("SETINDEXK", self.k(pos))
+                    pos += 1
+            elif f.ftype == "named":
+                self.emit("DUP")
+                self.compile_expr(f.value)
+                self.emit("SETINDEXK", self.k(f.key))
+            else:
+                self.emit("DUP")
+                self.compile_expr(f.key)
+                self.compile_expr(f.value)
+                self.emit("SETINDEX")
 
     def compile_expr(self, e):
         k = e.kind
@@ -572,37 +659,12 @@ class FuncCompiler:
             else:
                 self.compile_expr(e.key)
                 self.emit("GETINDEX")
-        elif k == "Call":
-            self.compile_expr(e.func)
-            for a in e.args:
-                self.compile_expr(a)
-            self.emit("CALL", len(e.args))
-        elif k == "MethodCall":
-            self.compile_expr(e.obj)
-            self.emit("DUP")
-            self.emit("GETFIELDK", self.k(e.method))
-            self.emit("SWAP")
-            for a in e.args:
-                self.compile_expr(a)
-            self.emit("CALL", len(e.args) + 1)
+        elif k == "Vararg":
+            self.emit("VARARG1")  # single-value context: first vararg only
+        elif k == "Call" or k == "MethodCall":
+            self._emit_call(e, multi=False)  # single result
         elif k == "TableExpr":
-            self.emit("NEWTABLE")
-            pos = 1
-            for f in e.fields:
-                if f.ftype == "pos":
-                    self.emit("DUP")
-                    self.compile_expr(f.value)
-                    self.emit("SETINDEXK", self.k(pos))
-                    pos += 1
-                elif f.ftype == "named":
-                    self.emit("DUP")
-                    self.compile_expr(f.value)
-                    self.emit("SETINDEXK", self.k(f.key))
-                else:
-                    self.emit("DUP")
-                    self.compile_expr(f.key)
-                    self.compile_expr(f.value)
-                    self.emit("SETINDEX")
+            self._compile_table(e)
         elif k == "BinOp":
             if e.op == "and":
                 self.compile_expr(e.left)
@@ -661,6 +723,16 @@ _OPCODES = [
     # generic-for support:
     "CALLR",   # call with a args, push exactly b results (nil-padded/truncated)
     "JMPNIL",  # pop; if the popped value is nil, jump (used for for-in end test)
+    # varargs + multiple return values (Stage 2):
+    "VARARG1",  # push the first vararg (single-value context)
+    "VARARG",   # push all varargs, set MC = count
+    "CALLV",    # call, nargs = a + MC, 1 result
+    "CALLM",    # call, nargs = a, push ALL results, set MC
+    "CALLVM",   # call, nargs = a + MC, push ALL results, set MC
+    "RETN",     # return exactly a values from the top of stack
+    "RETV",     # return a + MC values from the top of stack
+    "ADJV",     # adjust a (fixed) + MC values on top to exactly b values
+    "SETLISTV", # append MC values to the table below them, from index a
 ]
 
 # Opcodes whose handler sets `pc` itself; the trailing auto-increment must
@@ -668,9 +740,10 @@ _OPCODES = [
 _PC_SETTING = {"JMP", "JMPF", "JMPT", "FORCHECK", "JMPNIL"}
 
 
-def _handler_bodies(K):
+def _handler_bodies(K, pk):
     """Returns {opcode_name: [lua_line, ...]} for the dispatch, with the
-    per-build key `K` baked into every operand decode (`I[n]-K`)."""
+    per-build key `K` baked into every operand decode (`I[n]-K`) and `pk` the
+    name of the value packer used by multi-result calls."""
     d = str(K)
     g = f"I[2]-{d}"
     return {
@@ -733,17 +806,47 @@ def _handler_bodies(K):
                        "for _ix=1,_nr do SP=SP+1 ST[SP]=_rs[_ix] end"],
         "JMPNIL":     ["local _v=ST[SP]", "ST[SP]=nil", "SP=SP-1",
                        f"if _v==nil then pc={g} else pc=pc+1 end"],
+        "VARARG1":    ["SP=SP+1", "ST[SP]=VA[1]"],
+        "VARARG":     ["for _ix=1,VA.n do SP=SP+1 ST[SP]=VA[_ix] end", "MC=VA.n"],
+        "CALLV":      [f"local _na=({g})+MC", "local _ar={}",
+                       "for _ix=_na,1,-1 do _ar[_ix]=ST[SP] ST[SP]=nil SP=SP-1 end",
+                       "local _fn=ST[SP]", "ST[SP]=nil", "SP=SP-1",
+                       "local _r=_fn(table.unpack(_ar,1,_na))", "SP=SP+1", "ST[SP]=_r"],
+        "CALLM":      [f"local _na=({g})", "local _ar={}",
+                       "for _ix=_na,1,-1 do _ar[_ix]=ST[SP] ST[SP]=nil SP=SP-1 end",
+                       "local _fn=ST[SP]", "ST[SP]=nil", "SP=SP-1",
+                       f"local _rs={pk}(_fn(table.unpack(_ar,1,_na)))",
+                       "for _ix=1,_rs.n do SP=SP+1 ST[SP]=_rs[_ix] end", "MC=_rs.n"],
+        "CALLVM":     [f"local _na=({g})+MC", "local _ar={}",
+                       "for _ix=_na,1,-1 do _ar[_ix]=ST[SP] ST[SP]=nil SP=SP-1 end",
+                       "local _fn=ST[SP]", "ST[SP]=nil", "SP=SP-1",
+                       f"local _rs={pk}(_fn(table.unpack(_ar,1,_na)))",
+                       "for _ix=1,_rs.n do SP=SP+1 ST[SP]=_rs[_ix] end", "MC=_rs.n"],
+        "RETN":       [f"return table.unpack(ST,SP-({g})+1,SP)"],
+        "RETV":       [f"return table.unpack(ST,SP-(({g})+MC)+1,SP)"],
+        "ADJV":       [f"local _bse=SP-({g})-MC", f"local _tgt=_bse+(I[3]-{d})",
+                       "if _tgt>=SP then for _ix=SP+1,_tgt do ST[_ix]=nil end "
+                       "else for _ix=_tgt+1,SP do ST[_ix]=nil end end", "SP=_tgt"],
+        "SETLISTV":   ["local _tb=ST[SP-MC]",
+                       f"for _ix=1,MC do _tb[({g})+_ix-1]=ST[SP-MC+_ix] end",
+                       "for _ix=1,MC do ST[SP]=nil SP=SP-1 end"],
     }
 
 
-def _build_runtime(vmrun, op_map, key, order):
+def _build_runtime(vmrun, pk, op_map, key, order):
     """Generate the Lua source of the VM interpreter for this build.
 
+    vmrun:  name of the interpreter function
+    pk:     name of the arg/return packer (captures count incl. trailing nils)
     op_map: {opcode_name: random_int}   (the decoded opcode value)
     key:    per-build integer added to every stored bytecode number
     order:  opcode names in the (shuffled) order their branches appear
+
+    The 4th VMRUN parameter NP is the function's fixed parameter count: R gets
+    R[1..NP] from the packed args AG, and anything past NP forms the varargs
+    table VA (with VA.n), so `...` inside the bytecode reads true counts.
     """
-    bodies = _handler_bodies(key)
+    bodies = _handler_bodies(key, pk)
     branches = []
     for i, name in enumerate(order):
         kw = "if" if i == 0 else "elseif"
@@ -752,11 +855,18 @@ def _build_runtime(vmrun, op_map, key, order):
     dispatch = "\n".join(branches) + "\n    end"
     skip = " and ".join(f"op ~= {op_map[n]}" for n in sorted(_PC_SETTING, key=lambda x: op_map[x]))
     return (
-        f"local function {vmrun}(CODE, KC, GC, NR, AG)\n"
+        f"local {pk} = function(...) return {{n = select('#', ...), ...}} end\n"
+        f"local function {vmrun}(CODE, KC, GC, NP, AG)\n"
         f"  local R = {{}}\n"
-        f"  for _p = 1, #AG do R[_p] = AG[_p] end\n"
+        f"  local NA = AG.n\n"
+        f"  for _p = 1, NP do R[_p] = AG[_p] end\n"
+        f"  local VA = {{}}\n"
+        f"  local _vn = 0\n"
+        f"  for _p = NP + 1, NA do _vn = _vn + 1 VA[_vn] = AG[_p] end\n"
+        f"  VA.n = _vn\n"
         f"  local ST = {{}}\n"
         f"  local SP = 0\n"
+        f"  local MC = 0\n"
         f"  local pc = 1\n"
         f"  while true do\n"
         f"    local I = CODE[pc]\n"
@@ -785,6 +895,7 @@ def _lua_literal(v):
 class VmPass:
     def __init__(self, junk_prob=0.25):
         self.vmrun_name = _random_name()
+        self.pk_name = _random_name()
         self.used = False
         self.junk_prob = junk_prob
         # Per-build instruction set: each opcode gets a distinct random
@@ -799,7 +910,7 @@ class VmPass:
     def run(self, chunk):
         chunk.body = self.visit_block(chunk.body, Scope(None))
         if self.used:
-            runtime_src = _build_runtime(self.vmrun_name, self.op_map, self.key, self.order)
+            runtime_src = _build_runtime(self.vmrun_name, self.pk_name, self.op_map, self.key, self.order)
             header = parse(runtime_src).body
             chunk.body = header + chunk.body
         return chunk
@@ -836,10 +947,12 @@ class VmPass:
             if s.else_body is not None:
                 s.else_body = self.visit_block(s.else_body, Scope(scope))
         elif k == "FunctionDeclStmt":
-            s.body = self.try_vmify(s.params, s.body, scope) or self.visit_block(s.body, self._fn_scope(s.params, scope))
+            new_body = self.try_vmify(s, scope)
+            s.body = new_body if new_body is not None else self.visit_block(s.body, self._fn_scope(s.params, scope))
         elif k == "LocalFunctionStmt":
             scope.declare(s.name)
-            s.body = self.try_vmify(s.params, s.body, scope) or self.visit_block(s.body, self._fn_scope(s.params, scope))
+            new_body = self.try_vmify(s, scope)
+            s.body = new_body if new_body is not None else self.visit_block(s.body, self._fn_scope(s.params, scope))
         # ReturnStmt/BreakStmt/ContinueStmt/Goto/Label: nothing to recurse into structurally
         return s
 
@@ -849,17 +962,19 @@ class VmPass:
             inner.declare(p)
         return inner
 
-    def try_vmify(self, params, body, enclosing_scope):
-        """Returns a replacement body (a single CallStmt-free statement list
-        that invokes the VM) if eligible, else None (caller keeps recursing
-        normally)."""
+    def try_vmify(self, node, enclosing_scope):
+        """If `node` (a FunctionDeclStmt or LocalFunctionStmt) is eligible,
+        compile its body to bytecode, rewrite the wrapper to a vararg packer
+        that invokes the VM, and return the new body. Otherwise return None
+        and leave the node untouched."""
+        params, body = node.params, node.body
         if not body:
             return None
         if not EligibilityChecker(enclosing_scope).check(params, body):
             return None
         fc = FuncCompiler(junk_prob=self.junk_prob, op_names=_OPCODES)
         try:
-            code, consts, globs, nreg, _params = fc.compile_function(params, body)
+            code, consts, globs, nparams = fc.compile_function(params, body)
         except Exception:
             return None
         self.used = True
@@ -876,10 +991,16 @@ class VmPass:
         code_lit = "{" + ",".join(instrs) + "}"
         const_lit = "{" + ",".join(_lua_literal(c) for c in consts) + "}"
         global_lit = "{" + ",".join(globs) + "}"
-        args_lit = "{" + ",".join(params) + "}"
-        src = f"return {self.vmrun_name}({code_lit}, {const_lit}, {global_lit}, {nreg}, {args_lit})"
-        new_body = parse(src).body
-        return new_body
+        # Rewrite the wrapper to `(...)` and pass ALL incoming args packed (so
+        # the true count, trailing nils included, survives). For `:` methods
+        # `self` is bound implicitly and captured lexically in globals, so it
+        # is not part of `...` and nparams excludes it.
+        node.params = []
+        node.vararg = True
+        args_lit = f"{self.pk_name}(...)"
+        src = (f"return {self.vmrun_name}({code_lit}, {const_lit}, {global_lit}, "
+               f"{nparams}, {args_lit})")
+        return parse(src).body
 
     def _operand(self, x):
         # Patching must have replaced every None jump target by now; guard

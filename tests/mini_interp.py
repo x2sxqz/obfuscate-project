@@ -202,6 +202,13 @@ class Interp:
                 return "function"
             return "userdata"
 
+        def lua_select(n, *rest):
+            if n == "#":
+                return len(rest)
+            n = int(n)
+            return tuple(rest[n - 1:])
+
+        g.set("select", lua_select)
         g.set("print", lua_print)
         g.set("pairs", lua_pairs)
         g.set("ipairs", lua_ipairs)
