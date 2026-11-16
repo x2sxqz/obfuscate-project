@@ -44,6 +44,100 @@ def _random_name():
     return "_" + "".join(random.choices("0123456789abcdef", k=8))
 
 
+def _contains_nested(body):
+    """True if the statement list contains any nested function definition
+    (anonymous FunctionExpr or `local function`), at any depth. Such a
+    function must box its locals so inner closures can capture them."""
+    found = [False]
+
+    def walk_expr(e):
+        if found[0] or e is None:
+            return
+        k = e.kind
+        if k == "FunctionExpr":
+            found[0] = True
+            return
+        if k == "Paren":
+            walk_expr(e.expr)
+        elif k == "Index":
+            walk_expr(e.obj)
+            if not e.dot:
+                walk_expr(e.key)
+        elif k in ("Call",):
+            walk_expr(e.func)
+            for a in e.args:
+                walk_expr(a)
+        elif k == "MethodCall":
+            walk_expr(e.obj)
+            for a in e.args:
+                walk_expr(a)
+        elif k == "TableExpr":
+            for f in e.fields:
+                if f.ftype == "indexed":
+                    walk_expr(f.key)
+                walk_expr(f.value)
+        elif k == "BinOp":
+            walk_expr(e.left)
+            walk_expr(e.right)
+        elif k == "UnOp":
+            walk_expr(e.operand)
+
+    def walk_block(stmts):
+        for s in stmts:
+            if found[0]:
+                return
+            walk_stmt(s)
+
+    def walk_stmt(s):
+        if found[0]:
+            return
+        k = s.kind
+        if k == "LocalFunctionStmt":
+            found[0] = True
+        elif k == "FunctionDeclStmt":
+            found[0] = True
+        elif k == "LocalStmt":
+            for e in s.exprs:
+                walk_expr(e)
+        elif k == "AssignStmt":
+            for t in s.targets:
+                walk_expr(t)
+            for e in s.exprs:
+                walk_expr(e)
+        elif k == "CallStmt":
+            walk_expr(s.call)
+        elif k == "ReturnStmt":
+            for e in s.exprs:
+                walk_expr(e)
+        elif k == "DoStmt":
+            walk_block(s.body)
+        elif k == "WhileStmt":
+            walk_expr(s.cond)
+            walk_block(s.body)
+        elif k == "RepeatStmt":
+            walk_block(s.body)
+            walk_expr(s.cond)
+        elif k == "IfStmt":
+            for cond, b in s.clauses:
+                walk_expr(cond)
+                walk_block(b)
+            if s.else_body is not None:
+                walk_block(s.else_body)
+        elif k == "NumericForStmt":
+            walk_expr(s.start)
+            walk_expr(s.stop)
+            if s.step is not None:
+                walk_expr(s.step)
+            walk_block(s.body)
+        elif k == "GenericForStmt":
+            for e in s.exprs:
+                walk_expr(e)
+            walk_block(s.body)
+
+    walk_block(body)
+    return found[0]
+
+
 # ---------------------------------------------------------------------------
 # Eligibility analysis
 # ---------------------------------------------------------------------------
@@ -251,7 +345,7 @@ class EligibilityChecker:
 # ---------------------------------------------------------------------------
 
 class FuncCompiler:
-    def __init__(self, junk_prob=0.0, op_names=None):
+    def __init__(self, junk_prob=0.0, op_names=None, parent=None, boxed=False):
         self.consts = []
         self.const_idx = {}
         self.globals = []
@@ -260,6 +354,14 @@ class FuncCompiler:
         self.code = []  # list of instruction lists, e.g. [op, a, b]
         self.loop_stack = []  # for break patching: list of lists-of-jump-indices
         self.junk_prob = junk_prob
+        # closure support
+        self.parent = parent          # enclosing FuncCompiler (None at tree root)
+        self.boxed = boxed            # whether this function's locals are cells
+        self.local_regs = {}          # Lua-local name -> reg (excludes temps)
+        self.boxed_regs = set()       # reg indices that hold a cell
+        self.upvals = []              # list of (kind, idx): 0=parent local cell, 1=parent upval
+        self.upval_names = {}         # upvalue name -> 1-based upval index
+        self.children = []            # child FuncCompilers (nested protos), in emission order
 
     def k(self, value):
         # 1-indexed: these indices are used as K[idx] into a Lua table
@@ -287,6 +389,80 @@ class FuncCompiler:
             self.regs[name] = len(self.regs) + 1
         return self.regs[name]
 
+    # -- Lua-local declaration & name resolution (closure-aware) ----------
+    def declare_local(self, name):
+        """Allocate a register for an actual Lua local/param and record it as
+        a resolvable local (and as a cell if this function is boxed)."""
+        r = self.reg(name)
+        self.local_regs[name] = r
+        if self.boxed:
+            self.boxed_regs.add(r)
+        return r
+
+    def _resolve_upval(self, name):
+        """Return this function's 1-based upvalue index for `name`, allocating
+        one (and threading through intermediate frames) if it resolves to an
+        enclosing frame's local or upvalue; else None (it's a global)."""
+        if name in self.upval_names:
+            return self.upval_names[name]
+        if self.parent is None:
+            return None
+        if name in self.parent.local_regs:
+            desc = (0, self.parent.local_regs[name])      # capture parent's local cell
+        else:
+            pu = self.parent._resolve_upval(name)
+            if pu is None:
+                return None
+            desc = (1, pu)                                 # capture parent's upvalue
+        idx = len(self.upvals) + 1
+        self.upvals.append(desc)
+        self.upval_names[name] = idx
+        return idx
+
+    def resolve_name(self, name):
+        """('local', reg) | ('upval', idx) | ('global', None)."""
+        if name in self.local_regs:
+            return ("local", self.local_regs[name])
+        uv = self._resolve_upval(name)
+        if uv is not None:
+            return ("upval", uv)
+        return ("global", None)
+
+    def push_name(self, name):
+        kind, slot = self.resolve_name(name)
+        if kind == "local":
+            self.emit("PUSHCELL" if slot in self.boxed_regs else "PUSHREG", slot)
+        elif kind == "upval":
+            self.emit("PUSHUPVAL", slot)
+        else:
+            self.emit("PUSHGLOBAL", self.g(name))
+
+    def store_name(self, name):
+        """Assignment (not declaration): pops the stack top into `name`."""
+        kind, slot = self.resolve_name(name)
+        if kind == "local":
+            self.emit("STORECELL" if slot in self.boxed_regs else "POPREG", slot)
+        elif kind == "upval":
+            self.emit("STOREUPVAL", slot)
+        else:
+            # Writing a true global (or a real-Lua local outside the
+            # virtualized tree) can't be reflected back: disqualify this tree.
+            raise Disqualified()
+
+    def decl_name(self, name):
+        """Declaration: pops the stack top as the initial value, creating a
+        fresh cell if boxed (so each declaration — including per loop
+        iteration — yields a distinct upvalue cell)."""
+        self.declare_local(name)
+        self._store_fresh(name)
+
+    def _store_fresh(self, name):
+        """Pop the stack top into an already-declared local, as a FRESH cell
+        when boxed (DECLCELL). Used for loop variables so each iteration binds
+        a new cell, matching Lua's per-iteration variable semantics."""
+        r = self.local_regs[name]
+        self.emit("DECLCELL" if r in self.boxed_regs else "POPREG", r)
+
     def emit(self, *ins):
         # Returns the Python (0-indexed) list position of the instruction
         # just appended — use this return value only as the `idx` argument
@@ -308,17 +484,34 @@ class FuncCompiler:
     # -- compile entry -------------------------------------------------
     def compile_function(self, params, body):
         for p in params:
-            self.reg(p)
+            self.declare_local(p)
+        # If boxed, wrap each already-loaded param value into its own cell so
+        # closures can capture it. Done as the first instructions.
+        if self.boxed:
+            for p in params:
+                self.emit("BOXPARAM", self.local_regs[p])
         self.compile_block(body)
         self.emit("RET0")
-        # 4th value is nparams (fixed parameter count), used by the runtime to
-        # split the packed args into registers + the varargs table.
-        return self.code, self.consts, self.globals, len(params)
+        # nparams (fixed parameter count) lets the runtime split the packed
+        # args into registers + the varargs table.
+        self.nparams = len(params)
+        return self.code, self.consts, self.globals, self.nparams
 
     @staticmethod
     def _is_multi(e):
         """True if `e` can yield more than one value in a tail position."""
         return e.kind in ("Call", "MethodCall", "Vararg")
+
+    def _compile_closure(self, params, vararg, body):
+        """Compile a nested function into a child proto and emit CLOSURE. The
+        child captures this function's cells (or upvalues) by reference, so
+        mutations are shared exactly as Lua upvalues are."""
+        child = FuncCompiler(junk_prob=self.junk_prob, parent=self,
+                             boxed=_contains_nested(body))
+        _, _, _, child.nparams = child.compile_function(params, body)
+        idx = len(self.children) + 1  # 1-based index into PROTOS
+        self.children.append(child)
+        self.emit("CLOSURE", idx)
 
     def compile_block(self, stmts):
         for s in stmts:
@@ -337,12 +530,25 @@ class FuncCompiler:
         k = s.kind
         if k == "LocalStmt":
             if s.exprs:
+                # Compile RHS BEFORE declaring the names, so `local x = x`
+                # reads the outer x (Lua scope starts after the statement).
                 self._compile_list(s.exprs, len(s.names))  # exactly N values on top
                 for nm in reversed(s.names):
-                    self.emit("POPREG", self.reg(nm))
+                    self.decl_name(nm)  # fresh cell per declaration if boxed
             else:
                 for nm in s.names:
-                    self.reg(nm)
+                    r = self.declare_local(nm)
+                    if r in self.boxed_regs:
+                        self.emit("DECLCELLN", r)  # empty cell holding nil
+            return
+        if k == "LocalFunctionStmt":
+            # `local function f` == `local f; f = function...` — f is visible
+            # inside its own body (recursion) via its (boxed) cell.
+            r = self.declare_local(s.name)
+            if r in self.boxed_regs:
+                self.emit("DECLCELLN", r)
+            self._compile_closure(s.params, s.vararg, s.body)  # pushes the closure
+            self.store_name(s.name)                            # store into f's cell
             return
         if k == "AssignStmt":
             self._compile_list(s.exprs, len(s.targets))  # exactly N values on top
@@ -405,10 +611,14 @@ class FuncCompiler:
                 self.emit("PUSHK", self.k(1))
             step_r = self.reg(f"__forstep_{id(s)}")
             self.emit("POPREG", step_r)
+            # Declare the loop variable up front so the body resolves it; the
+            # fresh-cell DECLCELL (when boxed) is emitted inside the loop so
+            # each iteration gets its own cell for closures to capture.
+            self.declare_local(s.var)
             top = self.here()  # Lua-1-indexed jump-target VALUE for the back-edge
             forcheck_idx = self.emit("FORCHECK", ctrl, stop_r, step_r, None)  # python idx, for patch()
             self.emit("PUSHREG", ctrl)
-            self.emit("POPREG", self.reg(s.var))
+            self._store_fresh(s.var)
             self.loop_stack.append([])
             self.compile_block(s.body)
             self.emit("FORSTEP", ctrl, step_r)
@@ -420,6 +630,11 @@ class FuncCompiler:
             return
         if k == "GenericForStmt":
             # for v1..vn in explist do body end
+            # The header captures exactly the first 3 values; that's correct
+            # only when the last expression doesn't need to expand to fill
+            # remaining slots, and no extra (>3) expressions are dropped.
+            if len(s.exprs) > 3 or (len(s.exprs) > 1 and self._is_multi(s.exprs[-1])):
+                raise Disqualified()
             # Evaluate explist to exactly 3 values (iterator fn, state, ctrl).
             self._compile_explist3(s.exprs)
             reg_c = self.reg(f"__gfc_{id(s)}")
@@ -429,25 +644,27 @@ class FuncCompiler:
             self.emit("POPREG", reg_s)  # state
             self.emit("POPREG", reg_f)  # iterator fn
             nvars = len(s.names)
+            # declare loop vars up front (body resolves them); fresh cells are
+            # bound each iteration below so closures capture per-iteration vars.
+            for nm in s.names:
+                self.declare_local(nm)
+            key_tmp = self.reg(f"__gfk_{id(s)}")
             top = self.here()
             # call iterator: fn(state, ctrl) -> exactly nvars results
             self.emit("PUSHREG", reg_f)
             self.emit("PUSHREG", reg_s)
             self.emit("PUSHREG", reg_c)
             self.emit("CALLR", 2, nvars)  # 2 args, nvars results on stack (vN on top)
-            # pop results into the loop-var regs (reverse order), keeping the
-            # first result (control key) in a temp for the nil test.
-            var_regs = [self.reg(nm) for nm in s.names]
-            for r in reversed(var_regs[1:]):
-                self.emit("POPREG", r)
-            key_tmp = self.reg(f"__gfk_{id(s)}")
+            # bind vN..v2 into fresh cells (reverse), keep v1 (control key) in a temp
+            for nm in reversed(s.names[1:]):
+                self._store_fresh(nm)
             self.emit("POPREG", key_tmp)  # first result
             # if key is nil -> end loop
             self.emit("PUSHREG", key_tmp)
             jnil = self.emit("JMPNIL", None)
-            # not nil: var1 = key, ctrl = key
+            # not nil: var1 = key (fresh cell), ctrl = key
             self.emit("PUSHREG", key_tmp)
-            self.emit("POPREG", var_regs[0])
+            self._store_fresh(s.names[0])
             self.emit("PUSHREG", key_tmp)
             self.emit("POPREG", reg_c)
             self.loop_stack.append([])
@@ -481,7 +698,9 @@ class FuncCompiler:
             j = self.emit("JMP", None)
             self.loop_stack[-1].append(j)
             return
-        raise ValueError(f"vm: statement kind {k} should have been disqualified")
+        # ContinueStmt, GotoStmt, LabelStmt, nested FunctionDeclStmt: not
+        # supported — fall back to plain Lua for the whole tree.
+        raise Disqualified()
 
     def _compile_explist3(self, exprs):
         """Leave exactly 3 values on the stack (iterator fn, state, control)
@@ -502,7 +721,7 @@ class FuncCompiler:
 
     def compile_store(self, t):
         if t.kind == "Name":
-            self.emit("POPREG", self.reg(t.name))
+            self.store_name(t.name)
             return
         if t.kind == "Index":
             # stack currently has [..., value]; need obj/key pushed under it,
@@ -646,10 +865,9 @@ class FuncCompiler:
         elif k == "String":
             self.emit("PUSHK", self.k(e.value))
         elif k == "Name":
-            if e.name in self.regs or self._will_be_local(e.name):
-                self.emit("PUSHREG", self.reg(e.name))
-            else:
-                self.emit("PUSHGLOBAL", self.g(e.name))
+            self.push_name(e.name)
+        elif k == "FunctionExpr":
+            self._compile_closure(e.params, e.vararg, e.body)
         elif k == "Paren":
             self.compile_expr(e.expr)
         elif k == "Index":
@@ -733,6 +951,15 @@ _OPCODES = [
     "RETV",     # return a + MC values from the top of stack
     "ADJV",     # adjust a (fixed) + MC values on top to exactly b values
     "SETLISTV", # append MC values to the table below them, from index a
+    # closures + upvalues (Stage 3): captured locals live in 1-slot cells
+    "PUSHCELL",   # push R[a][1]   (read a boxed local)
+    "STORECELL",  # R[a][1] = pop  (assign a boxed local)
+    "DECLCELL",   # R[a] = {pop}   (declare boxed local = fresh cell w/ value)
+    "DECLCELLN",  # R[a] = {}      (declare boxed local = fresh empty cell)
+    "BOXPARAM",   # R[a] = {R[a]}  (wrap a loaded param into a cell)
+    "PUSHUPVAL",  # push UV[a][1]
+    "STOREUPVAL", # UV[a][1] = pop
+    "CLOSURE",    # build a closure from PROTOS[a], capturing cells per its upval descriptors
 ]
 
 # Opcodes whose handler sets `pc` itself; the trailing auto-increment must
@@ -740,10 +967,11 @@ _OPCODES = [
 _PC_SETTING = {"JMP", "JMPF", "JMPT", "FORCHECK", "JMPNIL"}
 
 
-def _handler_bodies(K, pk):
+def _handler_bodies(K, pk, vmrun):
     """Returns {opcode_name: [lua_line, ...]} for the dispatch, with the
-    per-build key `K` baked into every operand decode (`I[n]-K`) and `pk` the
-    name of the value packer used by multi-result calls."""
+    per-build key `K` baked into every operand decode (`I[n]-K`), `pk` the
+    name of the value packer, and `vmrun` the interpreter's own name (needed
+    by CLOSURE to build nested closures)."""
     d = str(K)
     g = f"I[2]-{d}"
     return {
@@ -830,6 +1058,18 @@ def _handler_bodies(K, pk):
         "SETLISTV":   ["local _tb=ST[SP-MC]",
                        f"for _ix=1,MC do _tb[({g})+_ix-1]=ST[SP-MC+_ix] end",
                        "for _ix=1,MC do ST[SP]=nil SP=SP-1 end"],
+        "PUSHCELL":   ["SP=SP+1", f"ST[SP]=R[{g}][1]"],
+        "STORECELL":  [f"R[{g}][1]=ST[SP]", "ST[SP]=nil", "SP=SP-1"],
+        "DECLCELL":   [f"R[{g}]={{ST[SP]}}", "ST[SP]=nil", "SP=SP-1"],
+        "DECLCELLN":  [f"R[{g}]={{}}"],
+        "BOXPARAM":   [f"R[{g}]={{R[{g}]}}"],
+        "PUSHUPVAL":  ["SP=SP+1", f"ST[SP]=UV[{g}][1]"],
+        "STOREUPVAL": [f"UV[{g}][1]=ST[SP]", "ST[SP]=nil", "SP=SP-1"],
+        "CLOSURE":    [f"local _pt=PROTOS[{g}]", "local _ds=_pt[5]", "local _uv={}",
+                       "for _j=1,#_ds do local _dd=_ds[_j] "
+                       "if _dd[1]==0 then _uv[_j]=R[_dd[2]] else _uv[_j]=UV[_dd[2]] end end",
+                       "SP=SP+1",
+                       f"ST[SP]=function(...) return {vmrun}(_pt[1],_pt[2],_pt[3],_pt[4],{pk}(...),_uv,_pt[6]) end"],
     }
 
 
@@ -846,7 +1086,7 @@ def _build_runtime(vmrun, pk, op_map, key, order):
     R[1..NP] from the packed args AG, and anything past NP forms the varargs
     table VA (with VA.n), so `...` inside the bytecode reads true counts.
     """
-    bodies = _handler_bodies(key, pk)
+    bodies = _handler_bodies(key, pk, vmrun)
     branches = []
     for i, name in enumerate(order):
         kw = "if" if i == 0 else "elseif"
@@ -856,7 +1096,7 @@ def _build_runtime(vmrun, pk, op_map, key, order):
     skip = " and ".join(f"op ~= {op_map[n]}" for n in sorted(_PC_SETTING, key=lambda x: op_map[x]))
     return (
         f"local {pk} = function(...) return {{n = select('#', ...), ...}} end\n"
-        f"local function {vmrun}(CODE, KC, GC, NP, AG)\n"
+        f"local function {vmrun}(CODE, KC, GC, NP, AG, UV, PROTOS)\n"
         f"  local R = {{}}\n"
         f"  local NA = AG.n\n"
         f"  for _p = 1, NP do R[_p] = AG[_p] end\n"
@@ -970,44 +1210,66 @@ class VmPass:
         params, body = node.params, node.body
         if not body:
             return None
-        if not EligibilityChecker(enclosing_scope).check(params, body):
-            return None
-        fc = FuncCompiler(junk_prob=self.junk_prob, op_names=_OPCODES)
+        fc = FuncCompiler(junk_prob=self.junk_prob, parent=None,
+                          boxed=_contains_nested(body))
         try:
             code, consts, globs, nparams = fc.compile_function(params, body)
+        except Disqualified:
+            return None
         except Exception:
             return None
         self.used = True
-        # Each slot = value + KEY. The opcode (slot 0) maps through op_map
-        # first; operands (slots 1+) are raw ints (indices / jump targets /
-        # arities), all shifted by the same key and decoded with `- KEY` at
-        # read time in the runtime.
-        k = self.key
-        instrs = []
-        for ins in code:
-            parts = [str(self.op_map[ins[0]] + k)]
-            parts.extend(self._operand(x) for x in ins[1:])
-            instrs.append("{" + ",".join(parts) + "}")
-        code_lit = "{" + ",".join(instrs) + "}"
+        code_lit = self._encode_code(code)
         const_lit = "{" + ",".join(_lua_literal(c) for c in consts) + "}"
         global_lit = "{" + ",".join(globs) + "}"
+        protos_lit = self._serialize_children(fc.children)
         # Rewrite the wrapper to `(...)` and pass ALL incoming args packed (so
         # the true count, trailing nils included, survives). For `:` methods
         # `self` is bound implicitly and captured lexically in globals, so it
-        # is not part of `...` and nparams excludes it.
+        # is not part of `...` and nparams excludes it. UV is empty: a
+        # top-level function has no in-tree upvalues (outer references are
+        # globals, captured lexically).
         node.params = []
         node.vararg = True
         args_lit = f"{self.pk_name}(...)"
         src = (f"return {self.vmrun_name}({code_lit}, {const_lit}, {global_lit}, "
-               f"{nparams}, {args_lit})")
+               f"{nparams}, {args_lit}, {{}}, {protos_lit})")
         return parse(src).body
 
+    # -- proto-tree serialization -----------------------------------------
     def _operand(self, x):
         # Patching must have replaced every None jump target by now; guard
         # anyway so a bug surfaces as a parse failure, not silent corruption.
         if x is None:
             x = 0
         return str(x + self.key)
+
+    def _encode_code(self, code):
+        # Each slot = value + KEY. The opcode (slot 0) maps through op_map
+        # first; operands (slots 1+) are raw ints shifted by the same key and
+        # decoded with `- KEY` at read time in the runtime.
+        k = self.key
+        instrs = []
+        for ins in code:
+            parts = [str(self.op_map[ins[0]] + k)]
+            parts.extend(self._operand(x) for x in ins[1:])
+            instrs.append("{" + ",".join(parts) + "}")
+        return "{" + ",".join(instrs) + "}"
+
+    def _serialize_children(self, children):
+        return "{" + ",".join(self._serialize_proto(c) for c in children) + "}"
+
+    def _serialize_proto(self, fc):
+        """Serialize one nested proto as a 6-tuple Lua literal:
+        {code, consts, globals, nparams, upval_descriptors, child_protos}.
+        Globals are bare identifiers captured lexically at the top wrapper."""
+        code_lit = self._encode_code(fc.code)
+        const_lit = "{" + ",".join(_lua_literal(c) for c in fc.consts) + "}"
+        global_lit = "{" + ",".join(fc.globals) + "}"
+        upval_lit = "{" + ",".join("{%d,%d}" % (knd, idx) for (knd, idx) in fc.upvals) + "}"
+        children_lit = self._serialize_children(fc.children)
+        return ("{" + code_lit + "," + const_lit + "," + global_lit + ","
+                + str(fc.nparams) + "," + upval_lit + "," + children_lit + "}")
 
 
 def vmify(chunk, junk_prob=0.25):
