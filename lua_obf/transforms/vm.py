@@ -247,7 +247,7 @@ class EligibilityChecker:
 # ---------------------------------------------------------------------------
 
 class FuncCompiler:
-    def __init__(self):
+    def __init__(self, junk_prob=0.0, op_names=None):
         self.consts = []
         self.const_idx = {}
         self.globals = []
@@ -255,6 +255,7 @@ class FuncCompiler:
         self.regs = {}
         self.code = []  # list of instruction lists, e.g. [op, a, b]
         self.loop_stack = []  # for break patching: list of lists-of-jump-indices
+        self.junk_prob = junk_prob
 
     def k(self, value):
         # 1-indexed: these indices are used as K[idx] into a Lua table
@@ -310,6 +311,15 @@ class FuncCompiler:
 
     def compile_block(self, stmts):
         for s in stmts:
+            # Junk NOPs between statements. Safe to insert anywhere in the
+            # linear stream: a NOP just falls through to the pc
+            # auto-increment, and every jump target is resolved from live
+            # here()/emit() positions, so inserting one never desyncs an
+            # address. A NOP must never be the block's trailing instruction
+            # of a return-terminated path, but compile_block only inserts
+            # *before* a statement, so the real statement always follows.
+            if self.junk_prob and random.random() < self.junk_prob:
+                self.emit("NOP")
             self.compile_stmt(s)
 
     def compile_stmt(self, s):
@@ -530,111 +540,128 @@ class FuncCompiler:
 
 # ---------------------------------------------------------------------------
 # Emitting the bytecode + a Lua VM body to execute it
+#
+# Polymorphic VM ("opcode / instruction-set randomization"):
+#   - Every opcode is a random integer, re-rolled on each build, so no two
+#     builds share an instruction set and no single hand-written decompiler
+#     can walk the bytecode of more than one build.
+#   - Every number stored in the bytecode (opcodes AND operands — register
+#     slots, constant-pool indices, jump targets, call arities) is encoded
+#     as `value + KEY`, where KEY is a random per-build integer, and decoded
+#     with `- KEY` at the one point each slot is read. So the bytecode array
+#     is a wall of meaningless large numbers rather than readable opcodes.
+#   - The dispatch branches are emitted in a shuffled order each build.
+#   - A NOP opcode exists and junk NOPs are sprinkled into the stream, so the
+#     instruction count and layout carry no reliable structure.
+# None of this changes semantics — it only moves the encoding around — so the
+# correctness guarantees of the compiler/eligibility analysis are untouched.
 # ---------------------------------------------------------------------------
 
-_VM_RUNTIME_TEMPLATE = """\
-local function {vmrun}(CODE, K, G, NREG, ARGS)
-  local R = {{}}
-  for i = 1, #ARGS do R[i] = ARGS[i] end
-  local ST = {{}}
-  local SP = 0
-  local pc = 1
-  while true do
-    local ins = CODE[pc]
-    local op = ins[1]
-    if op == "PUSHK" then
-      SP = SP + 1; ST[SP] = K[ins[2]]
-    elseif op == "PUSHREG" then
-      SP = SP + 1; ST[SP] = R[ins[2]]
-    elseif op == "POPREG" then
-      R[ins[2]] = ST[SP]; ST[SP] = nil; SP = SP - 1
-    elseif op == "PUSHGLOBAL" then
-      SP = SP + 1; ST[SP] = G[ins[2]]
-    elseif op == "POP" then
-      ST[SP] = nil; SP = SP - 1
-    elseif op == "DUP" then
-      SP = SP + 1; ST[SP] = ST[SP - 1]
-    elseif op == "SWAP" then
-      ST[SP], ST[SP - 1] = ST[SP - 1], ST[SP]
-    elseif op == "GETFIELDK" then
-      ST[SP] = ST[SP][K[ins[2]]]
-    elseif op == "GETINDEX" then
-      local key = ST[SP]; ST[SP] = nil; SP = SP - 1
-      ST[SP] = ST[SP][key]
-    elseif op == "SETFIELDK" then
-      local val = ST[SP]; ST[SP] = nil; SP = SP - 1
-      local obj = ST[SP]; ST[SP] = nil; SP = SP - 1
-      obj[K[ins[2]]] = val
-    elseif op == "SETINDEX" then
-      local val = ST[SP]; ST[SP] = nil; SP = SP - 1
-      local key = ST[SP]; ST[SP] = nil; SP = SP - 1
-      local obj = ST[SP]; ST[SP] = nil; SP = SP - 1
-      obj[key] = val
-    elseif op == "SETINDEXK" then
-      local val = ST[SP]; ST[SP] = nil; SP = SP - 1
-      local obj = ST[SP]; ST[SP] = nil; SP = SP - 1
-      obj[K[ins[2]]] = val
-    elseif op == "NEWTABLE" then
-      SP = SP + 1; ST[SP] = {{}}
-    elseif op == "CALL" then
-      local n = ins[2]
-      local args = {{}}
-      for i = n, 1, -1 do args[i] = ST[SP]; ST[SP] = nil; SP = SP - 1 end
-      local fn = ST[SP]; ST[SP] = nil; SP = SP - 1
-      local result = fn(table.unpack(args, 1, n))
-      SP = SP + 1; ST[SP] = result
-    elseif op == "BINOP" then
-      local b = ST[SP]; ST[SP] = nil; SP = SP - 1
-      local a = ST[SP]
-      local o = K[ins[2]]
-      if o == "+" then ST[SP] = a + b
-      elseif o == "-" then ST[SP] = a - b
-      elseif o == "*" then ST[SP] = a * b
-      elseif o == "/" then ST[SP] = a / b
-      elseif o == "%" then ST[SP] = a % b
-      elseif o == "^" then ST[SP] = a ^ b
-      elseif o == ".." then ST[SP] = a .. b
-      elseif o == "==" then ST[SP] = a == b
-      elseif o == "~=" then ST[SP] = a ~= b
-      elseif o == "<" then ST[SP] = a < b
-      elseif o == ">" then ST[SP] = a > b
-      elseif o == "<=" then ST[SP] = a <= b
-      elseif o == ">=" then ST[SP] = a >= b
-      end
-    elseif op == "UNOP" then
-      local o = K[ins[2]]
-      if o == "-" then ST[SP] = -ST[SP]
-      elseif o == "not" then ST[SP] = not ST[SP]
-      elseif o == "#" then ST[SP] = #ST[SP]
-      end
-    elseif op == "JMP" then
-      pc = ins[2]
-    elseif op == "JMPF" then
-      local v = ST[SP]; ST[SP] = nil; SP = SP - 1
-      if v == nil or v == false then pc = ins[2] else pc = pc + 1 end
-    elseif op == "JMPT" then
-      local v = ST[SP]; ST[SP] = nil; SP = SP - 1
-      if v ~= nil and v ~= false then pc = ins[2] else pc = pc + 1 end
-    elseif op == "FORCHECK" then
-      local ctrl, stop, step = R[ins[2]], R[ins[3]], R[ins[4]]
-      if (step > 0 and ctrl <= stop) or (step < 0 and ctrl >= stop) or step == 0 then
-        pc = pc + 1
-      else
-        pc = ins[5]
-      end
-    elseif op == "FORSTEP" then
-      R[ins[2]] = R[ins[2]] + R[ins[3]]
-    elseif op == "RET1" then
-      return ST[SP]
-    elseif op == "RET0" then
-      return nil
-    end
-    if op ~= "JMP" and op ~= "JMPF" and op ~= "JMPT" and op ~= "FORCHECK" then
-      pc = pc + 1
-    end
-  end
-end
-"""
+# Canonical opcode names the compiler emits. The runtime maps each to a
+# random integer per build; order here is irrelevant.
+_OPCODES = [
+    "PUSHK", "PUSHREG", "POPREG", "PUSHGLOBAL", "POP", "DUP", "SWAP",
+    "GETFIELDK", "GETINDEX", "SETFIELDK", "SETINDEX", "SETINDEXK",
+    "NEWTABLE", "CALL", "BINOP", "UNOP", "JMP", "JMPF", "JMPT",
+    "FORCHECK", "FORSTEP", "RET1", "RET0", "NOP",
+]
+
+# Opcodes whose handler sets `pc` itself; the trailing auto-increment must
+# skip them.
+_PC_SETTING = {"JMP", "JMPF", "JMPT", "FORCHECK"}
+
+
+def _handler_bodies(K):
+    """Returns {opcode_name: [lua_line, ...]} for the dispatch, with the
+    per-build key `K` baked into every operand decode (`I[n]-K`)."""
+    d = str(K)
+    g = f"I[2]-{d}"
+    return {
+        "PUSHK":      ["SP=SP+1", f"ST[SP]=KC[{g}]"],
+        "PUSHREG":    ["SP=SP+1", f"ST[SP]=R[{g}]"],
+        "POPREG":     [f"R[{g}]=ST[SP]", "ST[SP]=nil", "SP=SP-1"],
+        "PUSHGLOBAL": ["SP=SP+1", f"ST[SP]=GC[{g}]"],
+        "POP":        ["ST[SP]=nil", "SP=SP-1"],
+        "DUP":        ["SP=SP+1", "ST[SP]=ST[SP-1]"],
+        "SWAP":       ["ST[SP],ST[SP-1]=ST[SP-1],ST[SP]"],
+        "GETFIELDK":  [f"ST[SP]=ST[SP][KC[{g}]]"],
+        "GETINDEX":   ["local _ky=ST[SP]", "ST[SP]=nil", "SP=SP-1", "ST[SP]=ST[SP][_ky]"],
+        "SETFIELDK":  ["local _vv=ST[SP]", "ST[SP]=nil", "SP=SP-1",
+                       "local _ob=ST[SP]", "ST[SP]=nil", "SP=SP-1", f"_ob[KC[{g}]]=_vv"],
+        "SETINDEX":   ["local _vv=ST[SP]", "ST[SP]=nil", "SP=SP-1",
+                       "local _ky=ST[SP]", "ST[SP]=nil", "SP=SP-1",
+                       "local _ob=ST[SP]", "ST[SP]=nil", "SP=SP-1", "_ob[_ky]=_vv"],
+        "SETINDEXK":  ["local _vv=ST[SP]", "ST[SP]=nil", "SP=SP-1",
+                       "local _ob=ST[SP]", "ST[SP]=nil", "SP=SP-1", f"_ob[KC[{g}]]=_vv"],
+        "NEWTABLE":   ["SP=SP+1", "ST[SP]={}"],
+        "CALL":       [f"local _n=({g})", "local _ar={}",
+                       "for _ix=_n,1,-1 do _ar[_ix]=ST[SP] ST[SP]=nil SP=SP-1 end",
+                       "local _fn=ST[SP]", "ST[SP]=nil", "SP=SP-1",
+                       "local _rr=_fn(table.unpack(_ar,1,_n))", "SP=SP+1", "ST[SP]=_rr"],
+        "BINOP":      ["local _b=ST[SP]", "ST[SP]=nil", "SP=SP-1", "local _a=ST[SP]",
+                       f"local _o=KC[{g}]",
+                       'if _o=="+" then ST[SP]=_a+_b '
+                       'elseif _o=="-" then ST[SP]=_a-_b '
+                       'elseif _o=="*" then ST[SP]=_a*_b '
+                       'elseif _o=="/" then ST[SP]=_a/_b '
+                       'elseif _o=="%" then ST[SP]=_a%_b '
+                       'elseif _o=="^" then ST[SP]=_a^_b '
+                       'elseif _o==".." then ST[SP]=_a.._b '
+                       'elseif _o=="==" then ST[SP]=_a==_b '
+                       'elseif _o=="~=" then ST[SP]=_a~=_b '
+                       'elseif _o=="<" then ST[SP]=_a<_b '
+                       'elseif _o==">" then ST[SP]=_a>_b '
+                       'elseif _o=="<=" then ST[SP]=_a<=_b '
+                       'elseif _o==">=" then ST[SP]=_a>=_b end'],
+        "UNOP":       [f"local _o=KC[{g}]",
+                       'if _o=="-" then ST[SP]=-ST[SP] '
+                       'elseif _o=="not" then ST[SP]=not ST[SP] '
+                       'elseif _o=="#" then ST[SP]=#ST[SP] end'],
+        "JMP":        [f"pc={g}"],
+        "JMPF":       ["local _v=ST[SP]", "ST[SP]=nil", "SP=SP-1",
+                       f"if _v==nil or _v==false then pc={g} else pc=pc+1 end"],
+        "JMPT":       ["local _v=ST[SP]", "ST[SP]=nil", "SP=SP-1",
+                       f"if _v~=nil and _v~=false then pc={g} else pc=pc+1 end"],
+        "FORCHECK":   [f"local _c1,_c2,_c3=R[{g}],R[I[3]-{d}],R[I[4]-{d}]",
+                       "if (_c3>0 and _c1<=_c2) or (_c3<0 and _c1>=_c2) or _c3==0 then pc=pc+1 "
+                       f"else pc=I[5]-{d} end"],
+        "FORSTEP":    [f"R[{g}]=R[{g}]+R[I[3]-{d}]"],
+        "RET1":       ["return ST[SP]"],
+        "RET0":       ["return nil"],
+        "NOP":        ["ST[SP]=ST[SP]"],  # harmless; falls through to pc auto-increment
+    }
+
+
+def _build_runtime(vmrun, op_map, key, order):
+    """Generate the Lua source of the VM interpreter for this build.
+
+    op_map: {opcode_name: random_int}   (the decoded opcode value)
+    key:    per-build integer added to every stored bytecode number
+    order:  opcode names in the (shuffled) order their branches appear
+    """
+    bodies = _handler_bodies(key)
+    branches = []
+    for i, name in enumerate(order):
+        kw = "if" if i == 0 else "elseif"
+        lines = "\n      ".join(bodies[name])
+        branches.append(f"    {kw} op == {op_map[name]} then\n      {lines}")
+    dispatch = "\n".join(branches) + "\n    end"
+    skip = " and ".join(f"op ~= {op_map[n]}" for n in sorted(_PC_SETTING, key=lambda x: op_map[x]))
+    return (
+        f"local function {vmrun}(CODE, KC, GC, NR, AG)\n"
+        f"  local R = {{}}\n"
+        f"  for _p = 1, #AG do R[_p] = AG[_p] end\n"
+        f"  local ST = {{}}\n"
+        f"  local SP = 0\n"
+        f"  local pc = 1\n"
+        f"  while true do\n"
+        f"    local I = CODE[pc]\n"
+        f"    local op = I[1] - {key}\n"
+        f"{dispatch}\n"
+        f"    if {skip} then pc = pc + 1 end\n"
+        f"  end\n"
+        f"end\n"
+    )
 
 
 def _lua_literal(v):
@@ -652,14 +679,24 @@ def _lua_literal(v):
 
 
 class VmPass:
-    def __init__(self):
+    def __init__(self, junk_prob=0.25):
         self.vmrun_name = _random_name()
         self.used = False
+        self.junk_prob = junk_prob
+        # Per-build instruction set: each opcode gets a distinct random
+        # integer, and the branch order is shuffled. Both differ every build.
+        nums = random.sample(range(1, 4096), len(_OPCODES))
+        self.op_map = dict(zip(_OPCODES, nums))
+        self.order = list(_OPCODES)
+        random.shuffle(self.order)
+        # Per-build additive key applied to every number in the bytecode.
+        self.key = random.randint(1, 1_000_000)
 
     def run(self, chunk):
         chunk.body = self.visit_block(chunk.body, Scope(None))
         if self.used:
-            header = parse(_VM_RUNTIME_TEMPLATE.format(vmrun=self.vmrun_name)).body
+            runtime_src = _build_runtime(self.vmrun_name, self.op_map, self.key, self.order)
+            header = parse(runtime_src).body
             chunk.body = header + chunk.body
         return chunk
 
@@ -716,16 +753,23 @@ class VmPass:
             return None
         if not EligibilityChecker(enclosing_scope).check(params, body):
             return None
-        fc = FuncCompiler()
+        fc = FuncCompiler(junk_prob=self.junk_prob, op_names=_OPCODES)
         try:
             code, consts, globs, nreg, _params = fc.compile_function(params, body)
         except Exception:
             return None
         self.used = True
-        code_lit = "{" + ",".join(
-            "{" + ",".join([f'"{ins[0]}"'] + [self._operand(x) for x in ins[1:]]) + "}"
-            for ins in code
-        ) + "}"
+        # Each slot = value + KEY. The opcode (slot 0) maps through op_map
+        # first; operands (slots 1+) are raw ints (indices / jump targets /
+        # arities), all shifted by the same key and decoded with `- KEY` at
+        # read time in the runtime.
+        k = self.key
+        instrs = []
+        for ins in code:
+            parts = [str(self.op_map[ins[0]] + k)]
+            parts.extend(self._operand(x) for x in ins[1:])
+            instrs.append("{" + ",".join(parts) + "}")
+        code_lit = "{" + ",".join(instrs) + "}"
         const_lit = "{" + ",".join(_lua_literal(c) for c in consts) + "}"
         global_lit = "{" + ",".join(globs) + "}"
         args_lit = "{" + ",".join(params) + "}"
@@ -734,10 +778,12 @@ class VmPass:
         return new_body
 
     def _operand(self, x):
+        # Patching must have replaced every None jump target by now; guard
+        # anyway so a bug surfaces as a parse failure, not silent corruption.
         if x is None:
-            return "0"  # patched jump target of 0 is unreachable (pc starts at 1) if ever left
-        return str(x)
+            x = 0
+        return str(x + self.key)
 
 
-def vmify(chunk):
-    return VmPass().run(chunk)
+def vmify(chunk, junk_prob=0.25):
+    return VmPass(junk_prob=junk_prob).run(chunk)

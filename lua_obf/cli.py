@@ -61,6 +61,8 @@ def build_arg_parser():
                     help="0..1 chance an eligible block gets control-flow-flattened (default 0.6)")
     p.add_argument("--number-probability", type=float, default=0.85,
                     help="0..1 chance an eligible integer literal gets arithmetic-obfuscated (default 0.85)")
+    p.add_argument("--vm-junk", type=float, default=0.25,
+                    help="0..1 rate of junk NOP instructions sprinkled into VM bytecode (default 0.25)")
 
     p.add_argument("-q", "--quiet", action="store_true", help="only print errors")
     return p
@@ -103,7 +105,7 @@ def run(argv=None):
         obfuscate_numbers(ast, probability=args.number_probability)
         steps.append("numbers")
     if preset["vm"]:
-        vmify(ast)
+        vmify(ast, junk_prob=args.vm_junk)
         steps.append("vm")
     if preset["cff"]:
         flatten_control_flow(ast, probability=args.cff_probability)

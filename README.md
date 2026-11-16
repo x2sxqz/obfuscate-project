@@ -85,6 +85,16 @@ whitespace from the final output.
   Lua — this pass never ships a function it can't fully verify. See the
   docstring in `lua_obf/transforms/vm.py` for the full eligibility rules.
 
+  The VM is **polymorphic** (opcode / instruction-set randomization): on
+  every build, each opcode is a fresh random integer, every number in the
+  bytecode (opcodes *and* operands) is encoded as `value + key` with a
+  random per-build `key` and decoded only at read time, the dispatch
+  branches are emitted in shuffled order, and junk `NOP`s are sprinkled
+  through the instruction stream. So two builds of the same script share no
+  instruction set, the bytecode reads as a wall of meaningless large
+  numbers, and a decompiler written against one build does not transfer to
+  another. (`--vm-junk 0..1` tunes how many junk NOPs are inserted.)
+
 ## How it's built
 
 `lua_obf/lexer.py` and `lua_obf/parser.py` implement a Lua 5.1 / Luau-subset
