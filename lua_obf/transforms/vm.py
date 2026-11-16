@@ -186,10 +186,29 @@ class EligibilityChecker:
                     raise Disqualified()
                 self._expr(s.exprs[0], scope)
             return
+        if k == "GenericForStmt":
+            # for v1..vn in explist do body end. The VM's iterator setup
+            # captures exactly the first 3 values of the header, and each
+            # iteration call captures exactly n results. That's correct only
+            # when the header doesn't rely on the LAST expression expanding
+            # to fill remaining slots, and when there are no extra (>3)
+            # expressions whose side effects we'd skip.
+            exprs = s.exprs
+            if len(exprs) > 3:
+                raise Disqualified()
+            if len(exprs) > 1 and exprs[-1].kind in ("Call", "MethodCall", "Vararg"):
+                raise Disqualified()
+            for e in exprs:
+                self._expr(e, scope)
+            inner = Scope(scope)
+            for nm in s.names:
+                inner.declare(nm)
+            self._block(s.body, inner)
+            return
         if k == "BreakStmt":
             return
-        # GenericForStmt, ContinueStmt, GotoStmt, LabelStmt, FunctionDeclStmt,
-        # LocalFunctionStmt: all disqualifying.
+        # ContinueStmt, GotoStmt, LabelStmt, FunctionDeclStmt,
+        # LocalFunctionStmt: all still disqualifying (later stages).
         raise Disqualified()
 
     def _expr(self, e, scope):
@@ -411,6 +430,46 @@ class FuncCompiler:
             for b in self.loop_stack.pop():
                 self.patch(b, end)
             return
+        if k == "GenericForStmt":
+            # for v1..vn in explist do body end
+            # Evaluate explist to exactly 3 values (iterator fn, state, ctrl).
+            self._compile_explist3(s.exprs)
+            reg_c = self.reg(f"__gfc_{id(s)}")
+            reg_s = self.reg(f"__gfs_{id(s)}")
+            reg_f = self.reg(f"__gff_{id(s)}")
+            self.emit("POPREG", reg_c)  # ctrl (top)
+            self.emit("POPREG", reg_s)  # state
+            self.emit("POPREG", reg_f)  # iterator fn
+            nvars = len(s.names)
+            top = self.here()
+            # call iterator: fn(state, ctrl) -> exactly nvars results
+            self.emit("PUSHREG", reg_f)
+            self.emit("PUSHREG", reg_s)
+            self.emit("PUSHREG", reg_c)
+            self.emit("CALLR", 2, nvars)  # 2 args, nvars results on stack (vN on top)
+            # pop results into the loop-var regs (reverse order), keeping the
+            # first result (control key) in a temp for the nil test.
+            var_regs = [self.reg(nm) for nm in s.names]
+            for r in reversed(var_regs[1:]):
+                self.emit("POPREG", r)
+            key_tmp = self.reg(f"__gfk_{id(s)}")
+            self.emit("POPREG", key_tmp)  # first result
+            # if key is nil -> end loop
+            self.emit("PUSHREG", key_tmp)
+            jnil = self.emit("JMPNIL", None)
+            # not nil: var1 = key, ctrl = key
+            self.emit("PUSHREG", key_tmp)
+            self.emit("POPREG", var_regs[0])
+            self.emit("PUSHREG", key_tmp)
+            self.emit("POPREG", reg_c)
+            self.loop_stack.append([])
+            self.compile_block(s.body)
+            self.emit("JMP", top)
+            end = self.here()
+            self.patch(jnil, end)
+            for b in self.loop_stack.pop():
+                self.patch(b, end)
+            return
         if k == "ReturnStmt":
             if s.exprs:
                 self.compile_expr(s.exprs[0])
@@ -423,6 +482,23 @@ class FuncCompiler:
             self.loop_stack[-1].append(j)
             return
         raise ValueError(f"vm: statement kind {k} should have been disqualified")
+
+    def _compile_explist3(self, exprs):
+        """Leave exactly 3 values on the stack (iterator fn, state, control)
+        for a generic-for header. The common case is a single call
+        (`ipairs(t)` / `pairs(t)` / a custom iterator factory) whose first
+        three return values we want; otherwise each expression is a plain
+        single value (e.g. `next, t`), padded with nil to three."""
+        if len(exprs) == 1 and exprs[0].kind in ("Call", "MethodCall"):
+            self._compile_call(exprs[0], nresults=3)
+            return
+        n = len(exprs)
+        for e in exprs[:3]:
+            self.compile_expr(e)
+        # extra expressions beyond 3 would still be evaluated in Lua; the
+        # eligibility check forbids that shape, so here n <= 3 always.
+        for _ in range(n, 3):
+            self.emit("PUSHK", self.k(None))
 
     def compile_store(self, t):
         if t.kind == "Name":
@@ -444,6 +520,24 @@ class FuncCompiler:
                 self.emit("SETINDEX")
             return
         raise ValueError("vm: bad assignment target")
+
+    def _compile_call(self, e, nresults):
+        """Compile a Call/MethodCall, capturing exactly `nresults` results on
+        the stack (nil-padded / truncated). Used where a fixed number of
+        return values is needed, e.g. the iterator setup of a generic-for."""
+        if e.kind == "Call":
+            self.compile_expr(e.func)
+            for a in e.args:
+                self.compile_expr(a)
+            self.emit("CALLR", len(e.args), nresults)
+        else:  # MethodCall
+            self.compile_expr(e.obj)
+            self.emit("DUP")
+            self.emit("GETFIELDK", self.k(e.method))
+            self.emit("SWAP")
+            for a in e.args:
+                self.compile_expr(a)
+            self.emit("CALLR", len(e.args) + 1, nresults)
 
     def compile_expr(self, e):
         k = e.kind
@@ -564,11 +658,14 @@ _OPCODES = [
     "GETFIELDK", "GETINDEX", "SETFIELDK", "SETINDEX", "SETINDEXK",
     "NEWTABLE", "CALL", "BINOP", "UNOP", "JMP", "JMPF", "JMPT",
     "FORCHECK", "FORSTEP", "RET1", "RET0", "NOP",
+    # generic-for support:
+    "CALLR",   # call with a args, push exactly b results (nil-padded/truncated)
+    "JMPNIL",  # pop; if the popped value is nil, jump (used for for-in end test)
 ]
 
 # Opcodes whose handler sets `pc` itself; the trailing auto-increment must
 # skip them.
-_PC_SETTING = {"JMP", "JMPF", "JMPT", "FORCHECK"}
+_PC_SETTING = {"JMP", "JMPF", "JMPT", "FORCHECK", "JMPNIL"}
 
 
 def _handler_bodies(K):
@@ -629,6 +726,13 @@ def _handler_bodies(K):
         "RET1":       ["return ST[SP]"],
         "RET0":       ["return nil"],
         "NOP":        ["ST[SP]=ST[SP]"],  # harmless; falls through to pc auto-increment
+        "CALLR":      [f"local _na=({g})", f"local _nr=(I[3]-{d})", "local _ar={}",
+                       "for _ix=_na,1,-1 do _ar[_ix]=ST[SP] ST[SP]=nil SP=SP-1 end",
+                       "local _fn=ST[SP]", "ST[SP]=nil", "SP=SP-1",
+                       "local _rs={_fn(table.unpack(_ar,1,_na))}",
+                       "for _ix=1,_nr do SP=SP+1 ST[SP]=_rs[_ix] end"],
+        "JMPNIL":     ["local _v=ST[SP]", "ST[SP]=nil", "SP=SP-1",
+                       f"if _v==nil then pc={g} else pc=pc+1 end"],
     }
 
 
