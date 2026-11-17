@@ -967,13 +967,12 @@ _OPCODES = [
 _PC_SETTING = {"JMP", "JMPF", "JMPT", "FORCHECK", "JMPNIL"}
 
 
-def _handler_bodies(K, pk, vmrun):
+def _handler_bodies(_seed, pk, vmrun):
     """Returns {opcode_name: [lua_line, ...]} for the dispatch, with the
     per-build key `K` baked into every operand decode (`I[n]-K`), `pk` the
     name of the value packer, and `vmrun` the interpreter's own name (needed
     by CLOSURE to build nested closures)."""
-    d = str(K)
-    g = f"I[2]-{d}"
+    g = "I[2]"  # operands are decoded in place by the load-time rolling pass
     return {
         "PUSHK":      ["SP=SP+1", f"ST[SP]=KC[{g}]"],
         "PUSHREG":    ["SP=SP+1", f"ST[SP]=R[{g}]"],
@@ -1020,14 +1019,14 @@ def _handler_bodies(K, pk, vmrun):
                        f"if _v==nil or _v==false then pc={g} else pc=pc+1 end"],
         "JMPT":       ["local _v=ST[SP]", "ST[SP]=nil", "SP=SP-1",
                        f"if _v~=nil and _v~=false then pc={g} else pc=pc+1 end"],
-        "FORCHECK":   [f"local _c1,_c2,_c3=R[{g}],R[I[3]-{d}],R[I[4]-{d}]",
+        "FORCHECK":   [f"local _c1,_c2,_c3=R[{g}],R[I[3]],R[I[4]]",
                        "if (_c3>0 and _c1<=_c2) or (_c3<0 and _c1>=_c2) or _c3==0 then pc=pc+1 "
-                       f"else pc=I[5]-{d} end"],
-        "FORSTEP":    [f"R[{g}]=R[{g}]+R[I[3]-{d}]"],
+                       f"else pc=I[5] end"],
+        "FORSTEP":    [f"R[{g}]=R[{g}]+R[I[3]]"],
         "RET1":       ["return ST[SP]"],
         "RET0":       ["return nil"],
         "NOP":        ["ST[SP]=ST[SP]"],  # harmless; falls through to pc auto-increment
-        "CALLR":      [f"local _na=({g})", f"local _nr=(I[3]-{d})", "local _ar={}",
+        "CALLR":      [f"local _na=({g})", "local _nr=I[3]", "local _ar={}",
                        "for _ix=_na,1,-1 do _ar[_ix]=ST[SP] ST[SP]=nil SP=SP-1 end",
                        "local _fn=ST[SP]", "ST[SP]=nil", "SP=SP-1",
                        "local _rs={_fn(table.unpack(_ar,1,_na))}",
@@ -1052,7 +1051,7 @@ def _handler_bodies(K, pk, vmrun):
                        "for _ix=1,_rs.n do SP=SP+1 ST[SP]=_rs[_ix] end", "MC=_rs.n"],
         "RETN":       [f"return table.unpack(ST,SP-({g})+1,SP)"],
         "RETV":       [f"return table.unpack(ST,SP-(({g})+MC)+1,SP)"],
-        "ADJV":       [f"local _bse=SP-({g})-MC", f"local _tgt=_bse+(I[3]-{d})",
+        "ADJV":       [f"local _bse=SP-({g})-MC", "local _tgt=_bse+I[3]",
                        "if _tgt>=SP then for _ix=SP+1,_tgt do ST[_ix]=nil end "
                        "else for _ix=_tgt+1,SP do ST[_ix]=nil end end", "SP=_tgt"],
         "SETLISTV":   ["local _tb=ST[SP-MC]",
@@ -1073,20 +1072,26 @@ def _handler_bodies(K, pk, vmrun):
     }
 
 
-def _build_runtime(vmrun, pk, op_map, key, order):
+def _build_runtime(vmrun, pk, op_map, seed, order):
     """Generate the Lua source of the VM interpreter for this build.
 
     vmrun:  name of the interpreter function
     pk:     name of the arg/return packer (captures count incl. trailing nils)
     op_map: {opcode_name: random_int}   (the decoded opcode value)
-    key:    per-build integer added to every stored bytecode number
+    seed:   per-build seed for the rolling decode accumulator
     order:  opcode names in the (shuffled) order their branches appear
 
     The 4th VMRUN parameter NP is the function's fixed parameter count: R gets
     R[1..NP] from the packed args AG, and anything past NP forms the varargs
     table VA (with VA.n), so `...` inside the bytecode reads true counts.
+
+    Bytecode is stored under a ROLLING cipher: each number is encoded against a
+    running accumulator that folds in every value decoded before it, so the
+    array cannot be bulk-decoded statically — an analyzer has to replay the
+    exact chained sequence (which differs every build). The whole CODE table is
+    decoded in place once, on first entry, then executed normally.
     """
-    bodies = _handler_bodies(key, pk, vmrun)
+    bodies = _handler_bodies(seed, pk, vmrun)
     branches = []
     for i, name in enumerate(order):
         kw = "if" if i == 0 else "elseif"
@@ -1097,6 +1102,18 @@ def _build_runtime(vmrun, pk, op_map, key, order):
     return (
         f"local {pk} = function(...) return {{n = select('#', ...), ...}} end\n"
         f"local function {vmrun}(CODE, KC, GC, NP, AG, UV, PROTOS)\n"
+        f"  if not CODE.d then\n"
+        f"    local _ac = {seed}\n"
+        f"    for _i = 1, #CODE do\n"
+        f"      local _I = CODE[_i]\n"
+        f"      for _j = 1, #_I do\n"
+        f"        local _dv = (_I[_j] - _ac - _i - _j) % 4294967296\n"
+        f"        _I[_j] = _dv\n"
+        f"        _ac = (_ac * 131 + _dv + _i) % 4294967296\n"
+        f"      end\n"
+        f"    end\n"
+        f"    CODE.d = true\n"
+        f"  end\n"
         f"  local R = {{}}\n"
         f"  local NA = AG.n\n"
         f"  for _p = 1, NP do R[_p] = AG[_p] end\n"
@@ -1110,7 +1127,7 @@ def _build_runtime(vmrun, pk, op_map, key, order):
         f"  local pc = 1\n"
         f"  while true do\n"
         f"    local I = CODE[pc]\n"
-        f"    local op = I[1] - {key}\n"
+        f"    local op = I[1]\n"
         f"{dispatch}\n"
         f"    if {skip} then pc = pc + 1 end\n"
         f"  end\n"
@@ -1144,13 +1161,13 @@ class VmPass:
         self.op_map = dict(zip(_OPCODES, nums))
         self.order = list(_OPCODES)
         random.shuffle(self.order)
-        # Per-build additive key applied to every number in the bytecode.
-        self.key = random.randint(1, 1_000_000)
+        # Per-build seed for the rolling bytecode cipher (see _encode_code).
+        self.seed = random.randint(1, 4294967295)
 
     def run(self, chunk):
         chunk.body = self.visit_block(chunk.body, Scope(None))
         if self.used:
-            runtime_src = _build_runtime(self.vmrun_name, self.pk_name, self.op_map, self.key, self.order)
+            runtime_src = _build_runtime(self.vmrun_name, self.pk_name, self.op_map, self.seed, self.order)
             header = parse(runtime_src).body
             # Harden the interpreter: rename its readable internals (R, ST, op,
             # pc, handlers' temporaries, ...) so the dispatch no longer spells
@@ -1243,23 +1260,26 @@ class VmPass:
         return parse(src).body
 
     # -- proto-tree serialization -----------------------------------------
-    def _operand(self, x):
-        # Patching must have replaced every None jump target by now; guard
-        # anyway so a bug surfaces as a parse failure, not silent corruption.
-        if x is None:
-            x = 0
-        return str(x + self.key)
-
     def _encode_code(self, code):
-        # Each slot = value + KEY. The opcode (slot 0) maps through op_map
-        # first; operands (slots 1+) are raw ints shifted by the same key and
-        # decoded with `- KEY` at read time in the runtime.
-        k = self.key
+        """Serialize one proto's bytecode under the rolling cipher. Each
+        instruction's slots (opcode first, then operands) are walked in order,
+        and every value is encoded against an accumulator that folds in each
+        value already encoded. The runtime decodes with the exact inverse,
+        resetting the accumulator per proto. Static tools can't bulk-decode:
+        value N depends on values 1..N-1, and the seed/mixing differ each
+        build. This must stay in lock-step with the decode loop in
+        _build_runtime."""
+        MOD = 4294967296
+        acc = self.seed
         instrs = []
-        for ins in code:
-            parts = [str(self.op_map[ins[0]] + k)]
-            parts.extend(self._operand(x) for x in ins[1:])
-            instrs.append("{" + ",".join(parts) + "}")
+        for i, ins in enumerate(code, 1):
+            vals = [self.op_map[ins[0]]] + [(0 if x is None else x) for x in ins[1:]]
+            encs = []
+            for j, val in enumerate(vals, 1):
+                enc = (val + acc + i + j) % MOD
+                encs.append(str(enc))
+                acc = (acc * 131 + val + i) % MOD
+            instrs.append("{" + ",".join(encs) + "}")
         return "{" + ",".join(instrs) + "}"
 
     def _serialize_children(self, children):
