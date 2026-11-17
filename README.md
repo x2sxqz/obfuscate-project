@@ -10,7 +10,7 @@ code generator) as a CLI tool. Built for scripts run through an executor
 yours:
 
 ```
-pip install git+https://github.com/<you>/<repo>.git
+pip install git+https://github.com/x2sxqz/obfuscate-project.git
 ```
 
 This installs a `lua-obf` command on your `PATH` (via the `[project.scripts]`
@@ -22,13 +22,13 @@ lua-obf script.lua --preset max -o script.obf.lua
 ```
 
 To update after you push changes: `pip install --upgrade --force-reinstall
-git+https://github.com/<you>/<repo>.git`.
+git+https://github.com/x2sxqz/obfuscate-project.git`.
 
 **From a local clone** (editable install — picks up edits without
 reinstalling):
 
 ```
-git clone https://github.com/<you>/<repo>.git
+git clone https://github.com/x2sxqz/obfuscate-project.git
 cd <repo>
 pip install -e .
 ```
