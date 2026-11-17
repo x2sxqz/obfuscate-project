@@ -1348,12 +1348,18 @@ class VmPass:
         self.used = True
         # Hoist the two pure-constant tables (bytecode + const pool) to
         # module level so the rolling decode runs once, not every call.
-        code_name = self._hoist(self._encode_code(code))
-        const_name = self._hoist("{" + ",".join(_lua_literal(c) for c in consts) + "}")
-        code_lit = code_name
-        const_lit = const_name
+        code_lit = self._hoist(self._encode_code(code))
+        const_lit = self._hoist("{" + ",".join(_lua_literal(c) for c in consts) + "}")
         global_lit = "{" + ",".join(globs) + "}"
-        protos_lit = self._serialize_children(fc.children)
+        # Build the child proto tree as a flat sequence of `local p = {...}`
+        # statements (children before parents), not one deeply nested table
+        # literal — deep nesting trips Luau's "exceeded recursion depth" on
+        # scripts with nested closures. Globals stay inline so they are still
+        # captured per call (correct when a global is defined later in the
+        # file, or is an outer local the wrapper can see).
+        self._proto_decls = []
+        child_vars = [self._emit_proto(c) for c in fc.children]
+        protos_lit = "{" + ",".join(child_vars) + "}"
         # Rewrite the wrapper to `(...)` and pass ALL incoming args packed (so
         # the true count, trailing nils included, survives). For `:` methods
         # `self` is bound implicitly and captured lexically in globals, so it
@@ -1363,8 +1369,9 @@ class VmPass:
         node.params = []
         node.vararg = True
         args_lit = f"{self.pk_name}(...)"
-        src = (f"return {self.vmrun_name}({code_lit}, {const_lit}, {global_lit}, "
+        ret = (f"return {self.vmrun_name}({code_lit}, {const_lit}, {global_lit}, "
                f"{nparams}, {args_lit}, {{}}, {protos_lit})")
+        src = "\n".join(self._proto_decls + [ret])
         return parse(src).body
 
     # -- proto-tree serialization -----------------------------------------
@@ -1397,22 +1404,25 @@ class VmPass:
         b64 = std.translate(str.maketrans(_B64_STD, self.b64_alpha))
         return f"{self.decode_name}({lua_string_literal(b64)})"
 
-    def _serialize_children(self, children):
-        return "{" + ",".join(self._serialize_proto(c) for c in children) + "}"
-
-    def _serialize_proto(self, fc):
-        """Serialize one nested proto as a 6-tuple Lua literal:
-        {code, consts, globals, nparams, upval_descriptors, child_protos}.
-        Globals are bare identifiers captured lexically at the top wrapper."""
-        # Hoist this proto's bytecode + const pool too, so a closure's body is
-        # decoded once rather than every time the closure is created.
+    def _emit_proto(self, fc):
+        """Emit one proto as a flat `local p = {code, consts, globals, nparams,
+        upvals, {child vars}}` declaration (appended to self._proto_decls,
+        children first) and return its local variable name. The children field
+        references child proto LOCALS, not nested literals, so the proto tree
+        is a sequence of flat tables rather than one deeply nested expression.
+        Bytecode/const pools are hoisted to the module container; globals stay
+        inline for correct per-call capture."""
         code_lit = self._hoist(self._encode_code(fc.code))
         const_lit = self._hoist("{" + ",".join(_lua_literal(c) for c in fc.consts) + "}")
         global_lit = "{" + ",".join(fc.globals) + "}"
         upval_lit = "{" + ",".join("{%d,%d}" % (knd, idx) for (knd, idx) in fc.upvals) + "}"
-        children_lit = self._serialize_children(fc.children)
-        return ("{" + code_lit + "," + const_lit + "," + global_lit + ","
-                + str(fc.nparams) + "," + upval_lit + "," + children_lit + "}")
+        child_vars = [self._emit_proto(c) for c in fc.children]  # post-order
+        children_lit = "{" + ",".join(child_vars) + "}"
+        var = _random_name()
+        proto_lit = ("{" + code_lit + "," + const_lit + "," + global_lit + ","
+                     + str(fc.nparams) + "," + upval_lit + "," + children_lit + "}")
+        self._proto_decls.append(f"local {var} = {proto_lit}")
+        return var
 
 
 def vmify(chunk, junk_prob=0.25, name_style="confusable", anti_sandbox=False):
