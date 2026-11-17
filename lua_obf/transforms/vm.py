@@ -52,6 +52,19 @@ def _random_name():
     return random.choice(_NAME_FIRST) + "".join(random.choices(_NAME_REST, k=n - 1))
 
 
+def _env_gate():
+    """A Lua expression that is 0 on real Roblox and a nonzero corruption term
+    off it, for anti-sandbox binding. `typeof(game) == 'Instance'` holds in any
+    real Roblox execution context (executors included) but not in plain Lua /
+    an offline sandbox, where `typeof` is absent — so the decode seed is only
+    correct inside Roblox. The `and 0 or WRONG` yields 0 when the check passes
+    (0 is truthy in Lua) and WRONG when it fails."""
+    wrong = random.randint(1, 16777215)
+    # `typeof and ...` short-circuits in plain Lua (typeof is nil) without
+    # calling it, so this never errors off Roblox — it just yields WRONG.
+    return f" - ((typeof and typeof(game) == 'Instance') and 0 or {wrong})"
+
+
 def _contains_nested(body):
     """True if the statement list contains any nested function definition
     (anonymous FunctionExpr or `local function`), at any depth. Such a
@@ -1080,8 +1093,13 @@ def _handler_bodies(_seed, pk, vmrun):
     }
 
 
-def _build_runtime(vmrun, pk, decode, op_map, seed, order):
+def _build_runtime(vmrun, pk, decode, op_map, seed, order, gate=""):
     """Generate the Lua source of the VM interpreter for this build.
+
+    gate: optional Lua expression appended to the decode accumulator's seed.
+    When anti-sandbox is on it evaluates to 0 on real Roblox (so the decode is
+    correct) and to a nonzero corruption term off Roblox (so a plain-Lua
+    sandbox decodes only garbage and cannot dump the bytecode).
 
     vmrun:  name of the interpreter function
     pk:     name of the arg/return packer (captures count incl. trailing nils)
@@ -1142,7 +1160,7 @@ def _build_runtime(vmrun, pk, decode, op_map, seed, order):
         f"  local m = bi - pd\n"
         f"  local C = {{}}\n"
         f"  local p = 1\n"
-        f"  local _ac = {seed}\n"
+        f"  local _ac = {seed}{gate}\n"
         f"  local _ic = 0\n"
         f"  while p <= m do\n"
         f"    local cnt = B[p]\n"
@@ -1197,12 +1215,13 @@ def _lua_literal(v):
 
 
 class VmPass:
-    def __init__(self, junk_prob=0.25, name_style="confusable"):
+    def __init__(self, junk_prob=0.25, name_style="confusable", anti_sandbox=False):
         self.vmrun_name = _random_name()
         self.pk_name = _random_name()
         self.used = False
         self.junk_prob = junk_prob
         self.name_style = name_style  # style for renaming the interpreter internals
+        self.anti_sandbox = anti_sandbox
         # Module-level constant tables (bytecode + const pools) hoisted out of
         # the per-call path so they're built — and rolling-decoded — exactly
         # once, instead of rebuilt and re-decoded on every function call.
@@ -1220,7 +1239,9 @@ class VmPass:
     def run(self, chunk):
         chunk.body = self.visit_block(chunk.body, Scope(None))
         if self.used:
-            runtime_src = _build_runtime(self.vmrun_name, self.pk_name, self.decode_name, self.op_map, self.seed, self.order)
+            gate = _env_gate() if self.anti_sandbox else ""
+            runtime_src = _build_runtime(self.vmrun_name, self.pk_name, self.decode_name,
+                                         self.op_map, self.seed, self.order, gate=gate)
             header = parse(runtime_src).body
             # Harden the interpreter: rename its readable internals (R, ST, op,
             # pc, handlers' temporaries, ...) so the dispatch no longer spells
@@ -1374,5 +1395,6 @@ class VmPass:
                 + str(fc.nparams) + "," + upval_lit + "," + children_lit + "}")
 
 
-def vmify(chunk, junk_prob=0.25, name_style="confusable"):
-    return VmPass(junk_prob=junk_prob, name_style=name_style).run(chunk)
+def vmify(chunk, junk_prob=0.25, name_style="confusable", anti_sandbox=False):
+    return VmPass(junk_prob=junk_prob, name_style=name_style,
+                  anti_sandbox=anti_sandbox).run(chunk)

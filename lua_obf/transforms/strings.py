@@ -26,13 +26,21 @@ def _random_name():
     return "_" + "".join(random.choices("0123456789abcdef", k=8))
 
 
+def _env_gate():
+    """0 on real Roblox, a nonzero corruption term off it (anti-sandbox). See
+    vm._env_gate; `typeof` is absent in plain Lua so this never errors there."""
+    wrong = random.randint(1, 255)
+    return f" - ((typeof and typeof(game) == 'Instance') and 0 or {wrong})"
+
+
 class StringEncryptor:
-    def __init__(self):
+    def __init__(self, anti_sandbox=False):
         self.pool = []  # list of (salt, enc_bytes)
         self.key = random.randint(1, 250)
         self.table_name = _random_name()
         self.decode_fn = _random_name()
         self.key_name = _random_name()
+        self.anti_sandbox = anti_sandbox
 
     def _encode(self, s):
         salt = random.randint(0, 255)
@@ -62,8 +70,9 @@ class StringEncryptor:
             nums = ",".join(str(b) for b in enc)
             parts.append(f"{{{salt}{',' if nums else ''}{nums}}}")
         table_lit = "{" + ",".join(parts) + "}"
+        gate = _env_gate() if self.anti_sandbox else ""
         src = (
-            f"local {self.key_name} = {self.key}\n"
+            f"local {self.key_name} = {self.key}{gate}\n"
             f"local function {self.decode_fn}(t)\n"
             f"  local salt = t[1]\n"
             f"  local kk = ({self.key_name} + salt) % 256\n"
@@ -173,5 +182,5 @@ class StringEncryptor:
         raise ValueError(f"strings: unknown expr kind {k}")
 
 
-def encrypt_strings(chunk, min_len=1):
-    return StringEncryptor().run(chunk, min_len=min_len)
+def encrypt_strings(chunk, min_len=1, anti_sandbox=False):
+    return StringEncryptor(anti_sandbox=anti_sandbox).run(chunk, min_len=min_len)

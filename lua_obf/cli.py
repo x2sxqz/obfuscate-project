@@ -66,6 +66,11 @@ def build_arg_parser():
                     help="0..1 chance an eligible integer literal gets arithmetic-obfuscated (default 0.85)")
     p.add_argument("--vm-junk", type=float, default=0.25,
                     help="0..1 rate of junk NOP instructions sprinkled into VM bytecode (default 0.25)")
+    p.add_argument("--anti-sandbox", action="store_true",
+                    help="bind string + bytecode decoding to the Roblox environment "
+                         "(typeof(game)=='Instance'); run outside Roblox and it decodes to "
+                         "garbage, so it can't be dumped in a plain-Lua sandbox. "
+                         "WARNING: makes the output Roblox-only — don't use for generic Lua.")
 
     p.add_argument("-q", "--quiet", action="store_true", help="only print errors")
     return p
@@ -102,13 +107,14 @@ def run(argv=None):
         rename(ast, style=args.name_style)
         steps.append("rename")
     if preset["strings"]:
-        encrypt_strings(ast)
+        encrypt_strings(ast, anti_sandbox=args.anti_sandbox)
         steps.append("strings")
     if preset["numbers"]:
         obfuscate_numbers(ast, probability=args.number_probability)
         steps.append("numbers")
     if preset["vm"]:
-        vmify(ast, junk_prob=args.vm_junk, name_style=args.name_style)
+        vmify(ast, junk_prob=args.vm_junk, name_style=args.name_style,
+              anti_sandbox=args.anti_sandbox)
         steps.append("vm")
     if preset["cff"]:
         flatten_control_flow(ast, probability=args.cff_probability)
