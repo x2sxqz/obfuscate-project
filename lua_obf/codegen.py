@@ -24,7 +24,9 @@ def lua_string_literal(s):
         elif 32 <= o < 127:
             out.append(ch)
         else:
-            out.append(f"\\{o}")
+            # Always 3 digits: a short escape like \5 followed by a digit
+            # character would be misread by Lua as a different byte.
+            out.append(f"\\{o:03d}")
     out.append('"')
     return "".join(out)
 

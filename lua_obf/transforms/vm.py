@@ -33,6 +33,7 @@ across stock Lua, Lua 5.2+, and Luau, and is always correct because it's
 just normal lexical name resolution happening once, outside the VM.
 """
 
+import base64
 import random
 
 from ..astnodes import N
@@ -1079,7 +1080,7 @@ def _handler_bodies(_seed, pk, vmrun):
     }
 
 
-def _build_runtime(vmrun, pk, op_map, seed, order):
+def _build_runtime(vmrun, pk, decode, op_map, seed, order):
     """Generate the Lua source of the VM interpreter for this build.
 
     vmrun:  name of the interpreter function
@@ -1099,6 +1100,9 @@ def _build_runtime(vmrun, pk, op_map, seed, order):
     decoded in place once, on first entry, then executed normally.
     """
     bodies = _handler_bodies(seed, pk, vmrun)
+    # Internal-only names (renamed by the interpreter-hardening pass); not
+    # referenced from outside the runtime, so they need not be reserved.
+    b64a, b64l = "_B64A", "_B64L"
     branches = []
     for i, name in enumerate(order):
         kw = "if" if i == 0 else "elseif"
@@ -1108,19 +1112,55 @@ def _build_runtime(vmrun, pk, op_map, seed, order):
     skip = " and ".join(f"op ~= {op_map[n]}" for n in sorted(_PC_SETTING, key=lambda x: op_map[x]))
     return (
         f"local {pk} = function(...) return {{n = select('#', ...), ...}} end\n"
-        f"local function {vmrun}(CODE, KC, GC, NP, AG, UV, PROTOS)\n"
-        f"  if not CODE.d then\n"
-        f"    local _ac = {seed}\n"
-        f"    for _i = 1, #CODE do\n"
-        f"      local _I = CODE[_i]\n"
-        f"      for _j = 1, #_I do\n"
-        f"        local _dv = (_I[_j] - _ac - _i - _j) % 4294967296\n"
-        f"        _I[_j] = _dv\n"
-        f"        _ac = (_ac * 131 + _dv + _i) % 4294967296\n"
-        f"      end\n"
-        f"    end\n"
-        f"    CODE.d = true\n"
+        # Base64 reverse lookup, built once.
+        f"local {b64a} = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'\n"
+        f"local {b64l} = {{}}\n"
+        f"for _i = 1, 64 do {b64l}[string.byte({b64a}, _i)] = _i - 1 end\n"
+        # Unpack a base64 bytecode blob into the instruction table. The blob is
+        # base64-decoded to bytes, then read as: 1-byte slot count, then that
+        # many 3-byte big-endian values, every value under the rolling cipher
+        # (each depends on all values decoded before it). Runs once per proto
+        # at module load, so execution touches plain tables.
+        f"local function {decode}(s)\n"
+        f"  local B = {{}}\n"
+        f"  local bi = 0\n"
+        f"  local bt = string.byte\n"
+        f"  local ns = #s\n"
+        f"  local pd = 0\n"
+        f"  if ns > 0 and bt(s, ns) == 61 then pd = pd + 1 end\n"
+        f"  if ns > 1 and bt(s, ns - 1) == 61 then pd = pd + 1 end\n"
+        f"  local i = 1\n"
+        f"  while i <= ns do\n"
+        f"    local v = ({b64l}[bt(s, i)] or 0) * 262144 + ({b64l}[bt(s, i + 1)] or 0) * 4096 "
+        f"+ ({b64l}[bt(s, i + 2)] or 0) * 64 + ({b64l}[bt(s, i + 3)] or 0)\n"
+        f"    i = i + 4\n"
+        f"    B[bi + 1] = math.floor(v / 65536) % 256\n"
+        f"    B[bi + 2] = math.floor(v / 256) % 256\n"
+        f"    B[bi + 3] = v % 256\n"
+        f"    bi = bi + 3\n"
         f"  end\n"
+        f"  local m = bi - pd\n"
+        f"  local C = {{}}\n"
+        f"  local p = 1\n"
+        f"  local _ac = {seed}\n"
+        f"  local _ic = 0\n"
+        f"  while p <= m do\n"
+        f"    local cnt = B[p]\n"
+        f"    p = p + 1\n"
+        f"    _ic = _ic + 1\n"
+        f"    local I = {{}}\n"
+        f"    for _j = 1, cnt do\n"
+        f"      local enc = B[p] * 65536 + B[p + 1] * 256 + B[p + 2]\n"
+        f"      p = p + 3\n"
+        f"      local _dv = (enc - _ac - _ic - _j) % 16777216\n"
+        f"      I[_j] = _dv\n"
+        f"      _ac = (_ac * 131 + _dv + _ic) % 16777216\n"
+        f"    end\n"
+        f"    C[_ic] = I\n"
+        f"  end\n"
+        f"  return C\n"
+        f"end\n"
+        f"local function {vmrun}(CODE, KC, GC, NP, AG, UV, PROTOS)\n"
         f"  local R = {{}}\n"
         f"  local NA = AG.n\n"
         f"  for _p = 1, NP do R[_p] = AG[_p] end\n"
@@ -1174,12 +1214,13 @@ class VmPass:
         self.order = list(_OPCODES)
         random.shuffle(self.order)
         # Per-build seed for the rolling bytecode cipher (see _encode_code).
-        self.seed = random.randint(1, 4294967295)
+        self.seed = random.randint(1, 16777215)  # fits the 24-bit rolling cipher
+        self.decode_name = _random_name()
 
     def run(self, chunk):
         chunk.body = self.visit_block(chunk.body, Scope(None))
         if self.used:
-            runtime_src = _build_runtime(self.vmrun_name, self.pk_name, self.op_map, self.seed, self.order)
+            runtime_src = _build_runtime(self.vmrun_name, self.pk_name, self.decode_name, self.op_map, self.seed, self.order)
             header = parse(runtime_src).body
             # Harden the interpreter: rename its readable internals (R, ST, op,
             # pc, handlers' temporaries, ...) so the dispatch no longer spells
@@ -1187,7 +1228,7 @@ class VmPass:
             # vmified wrappers are kept verbatim.
             from .rename import rename as _rename
             _rename(N("Chunk", body=header), style=self.name_style,
-                    reserved={self.vmrun_name, self.pk_name})
+                    reserved={self.vmrun_name, self.pk_name, self.decode_name})
             # Hoisted constant tables go right after the runtime, before any
             # wrapper that references them (pure literals, no scope deps).
             hoist = []
@@ -1290,26 +1331,30 @@ class VmPass:
 
     # -- proto-tree serialization -----------------------------------------
     def _encode_code(self, code):
-        """Serialize one proto's bytecode under the rolling cipher. Each
-        instruction's slots (opcode first, then operands) are walked in order,
-        and every value is encoded against an accumulator that folds in each
-        value already encoded. The runtime decodes with the exact inverse,
-        resetting the accumulator per proto. Static tools can't bulk-decode:
-        value N depends on values 1..N-1, and the seed/mixing differ each
-        build. This must stay in lock-step with the decode loop in
-        _build_runtime."""
-        MOD = 4294967296
+        """Serialize one proto's bytecode as a single packed STRING (not a
+        number array), wrapped in a DECODE(...) call. Each instruction is a
+        1-byte slot count followed by its slots; every slot value (opcode
+        first, then operands) is encoded under the rolling cipher — against an
+        accumulator folding in each value already encoded — and stored as 3
+        big-endian bytes. Static tools can't bulk-decode: value N depends on
+        1..N-1, the seed/mixing differ each build, and the result reads as one
+        opaque string blob rather than thousands of numbers. Must stay in
+        lock-step with the DECODE function in _build_runtime."""
+        MOD = 16777216  # 2^24 -> 3 bytes per value
         acc = self.seed
-        instrs = []
+        out = []
         for i, ins in enumerate(code, 1):
             vals = [self.op_map[ins[0]]] + [(0 if x is None else x) for x in ins[1:]]
-            encs = []
+            out.append(chr(len(vals)))
             for j, val in enumerate(vals, 1):
                 enc = (val + acc + i + j) % MOD
-                encs.append(str(enc))
+                out.append(chr((enc >> 16) & 255))
+                out.append(chr((enc >> 8) & 255))
+                out.append(chr(enc & 255))
                 acc = (acc * 131 + val + i) % MOD
-            instrs.append("{" + ",".join(encs) + "}")
-        return "{" + ",".join(instrs) + "}"
+        blob = "".join(out)
+        b64 = base64.b64encode(blob.encode("latin1")).decode("ascii")
+        return f"{self.decode_name}({lua_string_literal(b64)})"
 
     def _serialize_children(self, children):
         return "{" + ",".join(self._serialize_proto(c) for c in children) + "}"
