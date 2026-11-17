@@ -39,7 +39,9 @@ def build_arg_parser():
              "medium (+ string & number obfuscation) / heavy (+ control-flow "
              "flattening, default) / max (+ bytecode VM for eligible functions)",
     )
-    p.add_argument("--minify", action="store_true", help="also strip layout whitespace in the final output")
+    p.add_argument("--minify", action="store_true", help="collapse the whole output onto a single line")
+    p.add_argument("--banner", default=None, metavar="TEXT",
+                    help="prepend a top-of-file comment, e.g. --banner \"This file was protected by REAPER HUB\"")
     p.add_argument("--name-style", choices=["confusable", "hex", "mixed"], default="confusable",
                     help="confusable: look-alike l/I/1/0/O/o/_ names, varied length (default, "
                          "hardest to read). mixed: varied a-z/A-Z/0-9 names (busy-looking). "
@@ -123,6 +125,12 @@ def run(argv=None):
         print(f"internal error: generated output failed to re-parse ({e}). "
               f"Please report this — nothing was written.", file=sys.stderr)
         return 2
+
+    if args.banner:
+        # One comment line per line of banner text, then the code. A Lua `--`
+        # comment runs to end of line, so each needs its own line.
+        banner = "\n".join("-- " + line for line in args.banner.split("\\n"))
+        out_src = banner + "\n" + out_src
 
     out_path = args.output or _default_output_path(args.input)
     with open(out_path, "w", encoding="utf-8") as f:
