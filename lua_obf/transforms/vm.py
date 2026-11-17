@@ -1093,8 +1093,14 @@ def _handler_bodies(_seed, pk, vmrun):
     }
 
 
-def _build_runtime(vmrun, pk, decode, op_map, seed, order, gate=""):
+_B64_STD = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+
+def _build_runtime(vmrun, pk, decode, op_map, seed, order, b64_alpha, gate=""):
     """Generate the Lua source of the VM interpreter for this build.
+
+    b64_alpha: this build's (shuffled) 64-character base64 alphabet, so the
+    blob is not recognizable as standard base64 and a generic decoder fails.
 
     gate: optional Lua expression appended to the decode accumulator's seed.
     When anti-sandbox is on it evaluates to 0 on real Roblox (so the decode is
@@ -1131,7 +1137,7 @@ def _build_runtime(vmrun, pk, decode, op_map, seed, order, gate=""):
     return (
         f"local {pk} = function(...) return {{n = select('#', ...), ...}} end\n"
         # Base64 reverse lookup, built once.
-        f"local {b64a} = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'\n"
+        f"local {b64a} = '{b64_alpha}'\n"
         f"local {b64l} = {{}}\n"
         f"for _i = 1, 64 do {b64l}[string.byte({b64a}, _i)] = _i - 1 end\n"
         # Unpack a base64 bytecode blob into the instruction table. The blob is
@@ -1222,10 +1228,13 @@ class VmPass:
         self.junk_prob = junk_prob
         self.name_style = name_style  # style for renaming the interpreter internals
         self.anti_sandbox = anti_sandbox
-        # Module-level constant tables (bytecode + const pools) hoisted out of
-        # the per-call path so they're built — and rolling-decoded — exactly
-        # once, instead of rebuilt and re-decoded on every function call.
-        self.hoisted = []  # list of (local_name, lua_literal)
+        # Constant tables (bytecode + const pools) hoisted out of the per-call
+        # path so they're built — and rolling-decoded — exactly once. They all
+        # live as entries of ONE container table rather than separate locals:
+        # Luau caps a function (the main chunk included) at 200 locals, and a
+        # big script has hundreds of vmified protos, which would blow that cap.
+        self.hoist_name = _random_name()
+        self.hoisted = []  # list of lua_literal (index = position in the container)
         # Per-build instruction set: each opcode gets a distinct random
         # integer, and the branch order is shuffled. Both differ every build.
         nums = random.sample(range(1, 4096), len(_OPCODES))
@@ -1235,13 +1244,19 @@ class VmPass:
         # Per-build seed for the rolling bytecode cipher (see _encode_code).
         self.seed = random.randint(1, 16777215)  # fits the 24-bit rolling cipher
         self.decode_name = _random_name()
+        # Per-build shuffled base64 alphabet: the blob reads as random text,
+        # not recognizable base64, and a stock base64 decoder won't touch it.
+        _a = list(_B64_STD)
+        random.shuffle(_a)
+        self.b64_alpha = "".join(_a)
 
     def run(self, chunk):
         chunk.body = self.visit_block(chunk.body, Scope(None))
         if self.used:
             gate = _env_gate() if self.anti_sandbox else ""
             runtime_src = _build_runtime(self.vmrun_name, self.pk_name, self.decode_name,
-                                         self.op_map, self.seed, self.order, gate=gate)
+                                         self.op_map, self.seed, self.order,
+                                         self.b64_alpha, gate=gate)
             header = parse(runtime_src).body
             # Harden the interpreter: rename its readable internals (R, ST, op,
             # pc, handlers' temporaries, ...) so the dispatch no longer spells
@@ -1250,20 +1265,22 @@ class VmPass:
             from .rename import rename as _rename
             _rename(N("Chunk", body=header), style=self.name_style,
                     reserved={self.vmrun_name, self.pk_name, self.decode_name})
-            # Hoisted constant tables go right after the runtime, before any
-            # wrapper that references them (pure literals, no scope deps).
+            # Hoisted constant tables: one container local, filled by
+            # assignments (statements don't count toward the 200-local cap).
             hoist = []
-            for name, lit in self.hoisted:
-                hoist.extend(parse(f"local {name} = {lit}").body)
+            if self.hoisted:
+                hoist.extend(parse(f"local {self.hoist_name} = {{}}").body)
+                for i, lit in enumerate(self.hoisted, 1):
+                    hoist.extend(parse(f"{self.hoist_name}[{i}] = {lit}").body)
             chunk.body = header + hoist + chunk.body
         return chunk
 
     def _hoist(self, lit):
-        """Register a constant table literal as a module-level local and return
-        its name, so it is created and decoded once rather than per call."""
-        name = _random_name()
-        self.hoisted.append((name, lit))
-        return name
+        """Register a constant table literal as an entry of the hoist container
+        and return the indexing expression, so it is built/decoded once at
+        load rather than per call — without spending a local per proto."""
+        self.hoisted.append(lit)
+        return f"{self.hoist_name}[{len(self.hoisted)}]"
 
     # Walk the tree with a real scope model so EligibilityChecker can tell
     # locals-of-this-function from upvalues-from-outside.
@@ -1374,7 +1391,10 @@ class VmPass:
                 out.append(chr(enc & 255))
                 acc = (acc * 131 + val + i) % MOD
         blob = "".join(out)
-        b64 = base64.b64encode(blob.encode("latin1")).decode("ascii")
+        # Standard base64, then remap onto this build's shuffled alphabet so
+        # the emitted string is not recognizable base64. Padding '=' is kept.
+        std = base64.b64encode(blob.encode("latin1")).decode("ascii")
+        b64 = std.translate(str.maketrans(_B64_STD, self.b64_alpha))
         return f"{self.decode_name}({lua_string_literal(b64)})"
 
     def _serialize_children(self, children):
