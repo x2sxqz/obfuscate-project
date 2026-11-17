@@ -40,8 +40,15 @@ from ..parser import parse
 from ..codegen import CodeGen, lua_string_literal
 
 
+_NAME_FIRST = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"
+_NAME_REST = _NAME_FIRST + "0123456789"
+
+
 def _random_name():
-    return "_" + "".join(random.choices("0123456789abcdef", k=8))
+    # Varied mixed-case/digit/underscore identifiers (not uniform hex), so the
+    # VM's own helper/table names blend with the mixed-style renamed code.
+    n = random.randint(12, 22)
+    return random.choice(_NAME_FIRST) + "".join(random.choices(_NAME_REST, k=n - 1))
 
 
 def _contains_nested(body):
@@ -1150,11 +1157,12 @@ def _lua_literal(v):
 
 
 class VmPass:
-    def __init__(self, junk_prob=0.25):
+    def __init__(self, junk_prob=0.25, name_style="confusable"):
         self.vmrun_name = _random_name()
         self.pk_name = _random_name()
         self.used = False
         self.junk_prob = junk_prob
+        self.name_style = name_style  # style for renaming the interpreter internals
         # Module-level constant tables (bytecode + const pools) hoisted out of
         # the per-call path so they're built — and rolling-decoded — exactly
         # once, instead of rebuilt and re-decoded on every function call.
@@ -1178,7 +1186,8 @@ class VmPass:
             # out what each opcode does. The two entry points referenced by the
             # vmified wrappers are kept verbatim.
             from .rename import rename as _rename
-            _rename(N("Chunk", body=header), reserved={self.vmrun_name, self.pk_name})
+            _rename(N("Chunk", body=header), style=self.name_style,
+                    reserved={self.vmrun_name, self.pk_name})
             # Hoisted constant tables go right after the runtime, before any
             # wrapper that references them (pure literals, no scope deps).
             hoist = []
@@ -1320,5 +1329,5 @@ class VmPass:
                 + str(fc.nparams) + "," + upval_lit + "," + children_lit + "}")
 
 
-def vmify(chunk, junk_prob=0.25):
-    return VmPass(junk_prob=junk_prob).run(chunk)
+def vmify(chunk, junk_prob=0.25, name_style="confusable"):
+    return VmPass(junk_prob=junk_prob, name_style=name_style).run(chunk)

@@ -42,9 +42,9 @@ def build_arg_parser():
     p.add_argument("--minify", action="store_true", help="collapse the whole output onto a single line")
     p.add_argument("--banner", default=None, metavar="TEXT",
                     help="prepend a top-of-file comment, e.g. --banner \"This file was protected by REAPER HUB\"")
-    p.add_argument("--name-style", choices=["confusable", "hex", "mixed"], default="confusable",
-                    help="confusable: look-alike l/I/1/0/O/o/_ names, varied length (default, "
-                         "hardest to read). mixed: varied a-z/A-Z/0-9 names (busy-looking). "
+    p.add_argument("--name-style", choices=["confusable", "hex", "mixed"], default="mixed",
+                    help="mixed: highly varied a-z/A-Z/0-9/_ names (default). confusable: "
+                         "look-alike l/I/1/0/O/o/_ names (hardest to read, but monotonous). "
                          "hex: _0x-style names, easiest to debug your own output.")
     p.add_argument("--seed", type=int, default=None, help="random seed, for reproducible output")
 
@@ -108,7 +108,7 @@ def run(argv=None):
         obfuscate_numbers(ast, probability=args.number_probability)
         steps.append("numbers")
     if preset["vm"]:
-        vmify(ast, junk_prob=args.vm_junk)
+        vmify(ast, junk_prob=args.vm_junk, name_style=args.name_style)
         steps.append("vm")
     if preset["cff"]:
         flatten_control_flow(ast, probability=args.cff_probability)

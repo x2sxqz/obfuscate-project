@@ -69,7 +69,7 @@ class Renamer:
     def _gen_candidate(self):
         if self.style == "mixed":
             first, rest = _MIX_FIRST, _MIX_REST
-            length = random.randint(max(4, self.min_len - 2), self.min_len + 8)
+            length = random.randint(self.min_len, self.min_len + 16)  # highly varied
         else:  # confusable
             first, rest = _CONF_FIRST, _CONF_REST
             length = random.randint(self.min_len, self.min_len + 10)
