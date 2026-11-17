@@ -1155,6 +1155,10 @@ class VmPass:
         self.pk_name = _random_name()
         self.used = False
         self.junk_prob = junk_prob
+        # Module-level constant tables (bytecode + const pools) hoisted out of
+        # the per-call path so they're built — and rolling-decoded — exactly
+        # once, instead of rebuilt and re-decoded on every function call.
+        self.hoisted = []  # list of (local_name, lua_literal)
         # Per-build instruction set: each opcode gets a distinct random
         # integer, and the branch order is shuffled. Both differ every build.
         nums = random.sample(range(1, 4096), len(_OPCODES))
@@ -1175,8 +1179,20 @@ class VmPass:
             # vmified wrappers are kept verbatim.
             from .rename import rename as _rename
             _rename(N("Chunk", body=header), reserved={self.vmrun_name, self.pk_name})
-            chunk.body = header + chunk.body
+            # Hoisted constant tables go right after the runtime, before any
+            # wrapper that references them (pure literals, no scope deps).
+            hoist = []
+            for name, lit in self.hoisted:
+                hoist.extend(parse(f"local {name} = {lit}").body)
+            chunk.body = header + hoist + chunk.body
         return chunk
+
+    def _hoist(self, lit):
+        """Register a constant table literal as a module-level local and return
+        its name, so it is created and decoded once rather than per call."""
+        name = _random_name()
+        self.hoisted.append((name, lit))
+        return name
 
     # Walk the tree with a real scope model so EligibilityChecker can tell
     # locals-of-this-function from upvalues-from-outside.
@@ -1242,8 +1258,12 @@ class VmPass:
         except Exception:
             return None
         self.used = True
-        code_lit = self._encode_code(code)
-        const_lit = "{" + ",".join(_lua_literal(c) for c in consts) + "}"
+        # Hoist the two pure-constant tables (bytecode + const pool) to
+        # module level so the rolling decode runs once, not every call.
+        code_name = self._hoist(self._encode_code(code))
+        const_name = self._hoist("{" + ",".join(_lua_literal(c) for c in consts) + "}")
+        code_lit = code_name
+        const_lit = const_name
         global_lit = "{" + ",".join(globs) + "}"
         protos_lit = self._serialize_children(fc.children)
         # Rewrite the wrapper to `(...)` and pass ALL incoming args packed (so
@@ -1289,8 +1309,10 @@ class VmPass:
         """Serialize one nested proto as a 6-tuple Lua literal:
         {code, consts, globals, nparams, upval_descriptors, child_protos}.
         Globals are bare identifiers captured lexically at the top wrapper."""
-        code_lit = self._encode_code(fc.code)
-        const_lit = "{" + ",".join(_lua_literal(c) for c in fc.consts) + "}"
+        # Hoist this proto's bytecode + const pool too, so a closure's body is
+        # decoded once rather than every time the closure is created.
+        code_lit = self._hoist(self._encode_code(fc.code))
+        const_lit = self._hoist("{" + ",".join(_lua_literal(c) for c in fc.consts) + "}")
         global_lit = "{" + ",".join(fc.globals) + "}"
         upval_lit = "{" + ",".join("{%d,%d}" % (knd, idx) for (knd, idx) in fc.upvals) + "}"
         children_lit = self._serialize_children(fc.children)
