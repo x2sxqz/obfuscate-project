@@ -52,6 +52,48 @@ def _random_name():
     return random.choice(_NAME_FIRST) + "".join(random.choices(_NAME_REST, k=n - 1))
 
 
+def _decl_name(node):
+    """Best-effort name of a function declaration: the local-function name, or
+    the dotted/`:` target of `function a.b.c()` / `function a:m()`."""
+    if node.kind == "LocalFunctionStmt":
+        return node.name
+    t = getattr(node, "target", None)
+    parts = []
+    while t is not None and t.kind == "Index":
+        parts.append(t.key.value)
+        t = t.obj
+    if t is not None and t.kind == "Name":
+        parts.append(t.name)
+    return ".".join(reversed(parts)) if parts else None
+
+
+def mark_skip_functions(chunk, names):
+    """Flag every function declaration whose name (or last dotted segment) is
+    in `names` with `skip_vm=True`, so vmify leaves it native. Must run BEFORE
+    renaming, while the original names are still present."""
+    names = set(names or ())
+    if not names:
+        return chunk
+
+    def walk(stmts):
+        for s in stmts:
+            k = s.kind
+            if k in ("FunctionDeclStmt", "LocalFunctionStmt"):
+                nm = _decl_name(s)
+                if nm and (nm in names or nm.split(".")[-1] in names):
+                    s.skip_vm = True
+                walk(s.body)
+            elif k in ("DoStmt", "WhileStmt", "RepeatStmt", "NumericForStmt", "GenericForStmt"):
+                walk(s.body)
+            elif k == "IfStmt":
+                for _, b in s.clauses:
+                    walk(b)
+                if s.else_body is not None:
+                    walk(s.else_body)
+    walk(chunk.body)
+    return chunk
+
+
 def _env_gate():
     """A Lua expression that is 0 on real Roblox and a nonzero corruption term
     off it, for anti-sandbox binding. `typeof(game) == 'Instance'` holds in any
@@ -1221,13 +1263,15 @@ def _lua_literal(v):
 
 
 class VmPass:
-    def __init__(self, junk_prob=0.25, name_style="confusable", anti_sandbox=False):
+    def __init__(self, junk_prob=0.25, name_style="confusable", anti_sandbox=False,
+                 skip_names=None):
         self.vmrun_name = _random_name()
         self.pk_name = _random_name()
         self.used = False
         self.junk_prob = junk_prob
         self.name_style = name_style  # style for renaming the interpreter internals
         self.anti_sandbox = anti_sandbox
+        self.skip_names = set(skip_names or ())  # functions to keep native (hot paths)
         # Constant tables (bytecode + const pools) hoisted out of the per-call
         # path so they're built — and rolling-decoded — exactly once. They all
         # live as entries of ONE container table rather than separate locals:
@@ -1337,6 +1381,10 @@ class VmPass:
         params, body = node.params, node.body
         if not body:
             return None
+        # Functions the user marked to keep native (hot/per-frame code the VM
+        # would make stutter). Marked before renaming, by original name.
+        if getattr(node, "skip_vm", False):
+            return None
         fc = FuncCompiler(junk_prob=self.junk_prob, parent=None,
                           boxed=_contains_nested(body))
         try:
@@ -1425,6 +1473,7 @@ class VmPass:
         return var
 
 
-def vmify(chunk, junk_prob=0.25, name_style="confusable", anti_sandbox=False):
+def vmify(chunk, junk_prob=0.25, name_style="confusable", anti_sandbox=False,
+          skip_names=None):
     return VmPass(junk_prob=junk_prob, name_style=name_style,
-                  anti_sandbox=anti_sandbox).run(chunk)
+                  anti_sandbox=anti_sandbox, skip_names=skip_names).run(chunk)

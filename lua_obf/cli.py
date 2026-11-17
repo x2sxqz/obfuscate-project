@@ -66,6 +66,10 @@ def build_arg_parser():
                     help="0..1 chance an eligible integer literal gets arithmetic-obfuscated (default 0.85)")
     p.add_argument("--vm-junk", type=float, default=0.25,
                     help="0..1 rate of junk NOP instructions sprinkled into VM bytecode (default 0.25)")
+    p.add_argument("--skip-vm", default="", metavar="NAMES",
+                    help="comma-separated function names to keep NATIVE (not virtualized), "
+                         "for hot/per-frame code that the VM would make stutter, "
+                         "e.g. --skip-vm updateESP,aimbotStep,onRenderStep")
     p.add_argument("--anti-sandbox", action="store_true",
                     help="bind string + bytecode decoding to the Roblox environment "
                          "(typeof(game)=='Instance'); run outside Roblox and it decodes to "
@@ -101,6 +105,12 @@ def run(argv=None):
     except ParseError as e:
         print(f"error: failed to parse {args.input}: {e}", file=sys.stderr)
         return 1
+
+    # Mark skip-vm functions by their ORIGINAL names, before renaming.
+    skip = [n.strip() for n in args.skip_vm.split(",") if n.strip()]
+    if skip and preset["vm"]:
+        from .transforms.vm import mark_skip_functions
+        mark_skip_functions(ast, skip)
 
     steps = []
     if preset["rename"]:
