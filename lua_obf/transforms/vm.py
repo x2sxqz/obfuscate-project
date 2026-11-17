@@ -1152,6 +1152,12 @@ class VmPass:
         if self.used:
             runtime_src = _build_runtime(self.vmrun_name, self.pk_name, self.op_map, self.key, self.order)
             header = parse(runtime_src).body
+            # Harden the interpreter: rename its readable internals (R, ST, op,
+            # pc, handlers' temporaries, ...) so the dispatch no longer spells
+            # out what each opcode does. The two entry points referenced by the
+            # vmified wrappers are kept verbatim.
+            from .rename import rename as _rename
+            _rename(N("Chunk", body=header), reserved={self.vmrun_name, self.pk_name})
             chunk.body = header + chunk.body
         return chunk
 

@@ -56,11 +56,15 @@ class Scope:
 
 
 class Renamer:
-    def __init__(self, style="confusable", min_len=8):
+    def __init__(self, style="confusable", min_len=8, reserved=None):
         self.counter = 0
         self.style = style
         self.min_len = min_len
-        self.used = set()  # every generated name, to guarantee global uniqueness
+        # Names that must be kept verbatim (e.g. the VM runtime's entry points
+        # referenced from outside it). They map to themselves and are seeded
+        # into `used` so no other local is ever renamed onto them.
+        self.reserved = set(reserved or ())
+        self.used = set(self.reserved)  # also guarantees global uniqueness
 
     def _gen_candidate(self):
         if self.style == "mixed":
@@ -91,7 +95,7 @@ class Renamer:
         return name
 
     def declare(self, scope, orig):
-        new = self._fresh()
+        new = orig if orig in self.reserved else self._fresh()
         scope.map[orig] = new
         return new
 
@@ -247,6 +251,6 @@ class Renamer:
         raise ValueError(f"rename: unknown expr kind {k}")
 
 
-def rename(chunk, style="confusable", min_len=8):
-    Renamer(style=style, min_len=min_len).run(chunk)
+def rename(chunk, style="confusable", min_len=8, reserved=None):
+    Renamer(style=style, min_len=min_len, reserved=reserved).run(chunk)
     return chunk
