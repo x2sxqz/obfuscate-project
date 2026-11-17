@@ -1138,7 +1138,7 @@ def _handler_bodies(_seed, pk, vmrun):
 _B64_STD = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 
 
-def _build_runtime(vmrun, pk, decode, op_map, seed, order, b64_alpha, gate=""):
+def _build_runtime(vmrun, pk, decode, empty, op_map, seed, order, b64_alpha, gate=""):
     """Generate the Lua source of the VM interpreter for this build.
 
     b64_alpha: this build's (shuffled) 64-character base64 alphabet, so the
@@ -1178,6 +1178,10 @@ def _build_runtime(vmrun, pk, decode, op_map, seed, order, b64_alpha, gate=""):
     skip = " and ".join(f"op ~= {op_map[n]}" for n in sorted(_PC_SETTING, key=lambda x: op_map[x]))
     return (
         f"local {pk} = function(...) return {{n = select('#', ...), ...}} end\n"
+        # Shared empty table (n=0) reused for empty varargs / empty upvalue and
+        # proto args, so the common call allocates fewer throwaway tables (less
+        # GC churn = less periodic stutter). Never mutated.
+        f"local {empty} = {{n = 0}}\n"
         # Base64 reverse lookup, built once.
         f"local {b64a} = '{b64_alpha}'\n"
         f"local {b64l} = {{}}\n"
@@ -1230,10 +1234,15 @@ def _build_runtime(vmrun, pk, decode, op_map, seed, order, b64_alpha, gate=""):
         f"  local R = {{}}\n"
         f"  local NA = AG.n\n"
         f"  for _p = 1, NP do R[_p] = AG[_p] end\n"
-        f"  local VA = {{}}\n"
-        f"  local _vn = 0\n"
-        f"  for _p = NP + 1, NA do _vn = _vn + 1 VA[_vn] = AG[_p] end\n"
-        f"  VA.n = _vn\n"
+        # Only materialize the varargs table when there actually are extra
+        # args; otherwise reuse the shared empty one.
+        f"  local VA = {empty}\n"
+        f"  if NA > NP then\n"
+        f"    VA = {{}}\n"
+        f"    local _vn = 0\n"
+        f"    for _p = NP + 1, NA do _vn = _vn + 1 VA[_vn] = AG[_p] end\n"
+        f"    VA.n = _vn\n"
+        f"  end\n"
         f"  local ST = {{}}\n"
         f"  local SP = 0\n"
         f"  local MC = 0\n"
@@ -1288,6 +1297,7 @@ class VmPass:
         # Per-build seed for the rolling bytecode cipher (see _encode_code).
         self.seed = random.randint(1, 16777215)  # fits the 24-bit rolling cipher
         self.decode_name = _random_name()
+        self.empty_name = _random_name()  # shared empty table, to cut per-call allocs
         # Per-build shuffled base64 alphabet: the blob reads as random text,
         # not recognizable base64, and a stock base64 decoder won't touch it.
         _a = list(_B64_STD)
@@ -1299,7 +1309,7 @@ class VmPass:
         if self.used:
             gate = _env_gate() if self.anti_sandbox else ""
             runtime_src = _build_runtime(self.vmrun_name, self.pk_name, self.decode_name,
-                                         self.op_map, self.seed, self.order,
+                                         self.empty_name, self.op_map, self.seed, self.order,
                                          self.b64_alpha, gate=gate)
             header = parse(runtime_src).body
             # Harden the interpreter: rename its readable internals (R, ST, op,
@@ -1308,7 +1318,7 @@ class VmPass:
             # vmified wrappers are kept verbatim.
             from .rename import rename as _rename
             _rename(N("Chunk", body=header), style=self.name_style,
-                    reserved={self.vmrun_name, self.pk_name, self.decode_name})
+                    reserved={self.vmrun_name, self.pk_name, self.decode_name, self.empty_name})
             # Hoisted constant tables: one container local, filled by
             # assignments (statements don't count toward the 200-local cap).
             hoist = []
@@ -1407,18 +1417,20 @@ class VmPass:
         # file, or is an outer local the wrapper can see).
         self._proto_decls = []
         child_vars = [self._emit_proto(c) for c in fc.children]
-        protos_lit = "{" + ",".join(child_vars) + "}"
+        # Reuse the shared empty table when there are no children, instead of
+        # allocating a fresh {} on every call.
+        protos_lit = ("{" + ",".join(child_vars) + "}") if child_vars else self.empty_name
         # Rewrite the wrapper to `(...)` and pass ALL incoming args packed (so
         # the true count, trailing nils included, survives). For `:` methods
         # `self` is bound implicitly and captured lexically in globals, so it
-        # is not part of `...` and nparams excludes it. UV is empty: a
-        # top-level function has no in-tree upvalues (outer references are
-        # globals, captured lexically).
+        # is not part of `...` and nparams excludes it. UV is the shared empty
+        # table: a top-level function has no in-tree upvalues (outer references
+        # are globals, captured lexically).
         node.params = []
         node.vararg = True
         args_lit = f"{self.pk_name}(...)"
         ret = (f"return {self.vmrun_name}({code_lit}, {const_lit}, {global_lit}, "
-               f"{nparams}, {args_lit}, {{}}, {protos_lit})")
+               f"{nparams}, {args_lit}, {self.empty_name}, {protos_lit})")
         src = "\n".join(self._proto_decls + [ret])
         return parse(src).body
 
