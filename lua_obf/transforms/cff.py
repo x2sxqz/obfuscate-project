@@ -183,13 +183,16 @@ class CFFPass:
         n = len(branch_stmts)
         ids = self.rng.sample(range(10000, 999999), n)
         state_name = _random_name()
+        # Random terminal sentinel (outside the id range), not a fixed 0, so
+        # the dispatcher carries no `~= 0` signature to fingerprint.
+        term = self.rng.randint(1, 9999)
 
         if_clauses = []
         for i, bs in enumerate(branch_stmts):
             body = list(bs)
             ends_in_return = body and body[-1].kind == "ReturnStmt"
             if not ends_in_return:
-                next_id = ids[i + 1] if i + 1 < n else 0
+                next_id = ids[i + 1] if i + 1 < n else term
                 body.append(N("AssignStmt", targets=[N("Name", name=state_name)], exprs=[N("Number", raw=str(next_id))]))
             if_clauses.append((ids[i], body))
 
@@ -201,11 +204,26 @@ class CFFPass:
             for idx in display_order
         ]
 
-        dispatcher = N(
-            "WhileStmt",
-            cond=N("BinOp", op="~=", left=N("Name", name=state_name), right=N("Number", raw="0")),
-            body=[N("IfStmt", clauses=shuffled_clauses, else_body=None)],
-        )
+        # Two dispatcher shapes, chosen per flattened block, so the loop
+        # structure itself varies instead of always being `while X ~= 0 do`.
+        if self.rng.random() < 0.5:
+            dispatcher = N(
+                "WhileStmt",
+                cond=N("BinOp", op="~=", left=N("Name", name=state_name),
+                       right=N("Number", raw=str(term))),
+                body=[N("IfStmt", clauses=shuffled_clauses, else_body=None)],
+            )
+        else:
+            # `while true do ... if STATE == term then break end ... end`
+            brk = (N("BinOp", op="==", left=N("Name", name=state_name),
+                     right=N("Number", raw=str(term))), [N("BreakStmt")])
+            clauses2 = list(shuffled_clauses)
+            clauses2.insert(self.rng.randint(0, len(clauses2)), brk)
+            dispatcher = N(
+                "WhileStmt",
+                cond=N("True"),
+                body=[N("IfStmt", clauses=clauses2, else_body=None)],
+            )
 
         result = []
         if hoisted:

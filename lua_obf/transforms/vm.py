@@ -1138,7 +1138,7 @@ def _handler_bodies(_seed, pk, vmrun):
 _B64_STD = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 
 
-def _build_runtime(vmrun, pk, decode, empty, op_map, seed, order, b64_alpha, gate=""):
+def _build_runtime(vmrun, pk, decode, empty, dispatch, skip_nums, seed, b64_alpha, gate=""):
     """Generate the Lua source of the VM interpreter for this build.
 
     b64_alpha: this build's (shuffled) 64-character base64 alphabet, so the
@@ -1169,13 +1169,17 @@ def _build_runtime(vmrun, pk, decode, empty, op_map, seed, order, b64_alpha, gat
     # Internal-only names (renamed by the interpreter-hardening pass); not
     # referenced from outside the runtime, so they need not be reserved.
     b64a, b64l = "_B64A", "_B64L"
+    _junk = ("ST[SP]=ST[SP]", "MC=MC", "R[NP]=R[NP]", "pc=pc+0", "SP=SP+0")
     branches = []
-    for i, name in enumerate(order):
+    for i, (name, num) in enumerate(dispatch):
         kw = "if" if i == 0 else "elseif"
-        lines = "\n      ".join(bodies[name])
-        branches.append(f"    {kw} op == {op_map[name]} then\n      {lines}")
+        if name is None:  # bogus decoy handler, never emitted into any bytecode
+            lines = _junk[num % len(_junk)]
+        else:
+            lines = "\n      ".join(bodies[name])
+        branches.append(f"    {kw} op == {num} then\n      {lines}")
     dispatch = "\n".join(branches) + "\n    end"
-    skip = " and ".join(f"op ~= {op_map[n]}" for n in sorted(_PC_SETTING, key=lambda x: op_map[x]))
+    skip = " and ".join(f"op ~= {num}" for num in skip_nums)
     return (
         f"local {pk} = function(...) return {{n = select('#', ...), ...}} end\n"
         # Shared empty table (n=0) reused for empty varargs / empty upvalue and
@@ -1288,12 +1292,26 @@ class VmPass:
         # big script has hundreds of vmified protos, which would blow that cap.
         self.hoist_name = _random_name()
         self.hoisted = []  # list of lua_literal (index = position in the container)
-        # Per-build instruction set: each opcode gets a distinct random
-        # integer, and the branch order is shuffled. Both differ every build.
-        nums = random.sample(range(1, 4096), len(_OPCODES))
-        self.op_map = dict(zip(_OPCODES, nums))
-        self.order = list(_OPCODES)
-        random.shuffle(self.order)
+        # Per-build instruction set. Each opcode gets 1-3 distinct numbers
+        # (aliases); the emitter picks one at random per instruction, so the
+        # opcode->operation map is many-to-one and differs every build (a
+        # devirtualizer for one build can't assume opcode N always means op X).
+        # A handful of bogus opcodes get decoy handlers that are never emitted,
+        # padding the dispatch with dead branches. Branch order is shuffled.
+        pool = random.sample(range(1, 1_000_000), len(_OPCODES) * 3 + 10)
+        pi = 0
+        self.op_numbers = {}  # name -> [num, ...] (first is canonical)
+        for name in _OPCODES:
+            k = random.choice((1, 1, 2, 2, 3))
+            self.op_numbers[name] = pool[pi:pi + k]
+            pi += k
+        self.bogus_nums = pool[pi:pi + random.randint(3, 8)]
+        # op_map keeps a single representative per name (for _PC_SETTING etc.)
+        self.op_map = {name: nums[0] for name, nums in self.op_numbers.items()}
+        # dispatch entries: every (name, num) plus bogus, in shuffled order
+        self.dispatch = [(name, num) for name, nums in self.op_numbers.items() for num in nums]
+        self.dispatch += [(None, b) for b in self.bogus_nums]
+        random.shuffle(self.dispatch)
         # Per-build seed for the rolling bytecode cipher (see _encode_code).
         self.seed = random.randint(1, 16777215)  # fits the 24-bit rolling cipher
         self.decode_name = _random_name()
@@ -1308,8 +1326,11 @@ class VmPass:
         chunk.body = self.visit_block(chunk.body, Scope(None))
         if self.used:
             gate = _env_gate() if self.anti_sandbox else ""
+            # Every number that any pc-setting opcode can appear as must be in
+            # the trailing-increment skip test.
+            skip_nums = [num for n in _PC_SETTING for num in self.op_numbers[n]]
             runtime_src = _build_runtime(self.vmrun_name, self.pk_name, self.decode_name,
-                                         self.empty_name, self.op_map, self.seed, self.order,
+                                         self.empty_name, self.dispatch, skip_nums, self.seed,
                                          self.b64_alpha, gate=gate)
             header = parse(runtime_src).body
             # Harden the interpreter: rename its readable internals (R, ST, op,
@@ -1449,7 +1470,10 @@ class VmPass:
         acc = self.seed
         out = []
         for i, ins in enumerate(code, 1):
-            vals = [self.op_map[ins[0]]] + [(0 if x is None else x) for x in ins[1:]]
+            # Pick one of this opcode's alias numbers at random, so the same
+            # operation appears under different opcodes through the bytecode.
+            opnum = random.choice(self.op_numbers[ins[0]])
+            vals = [opnum] + [(0 if x is None else x) for x in ins[1:]]
             out.append(chr(len(vals)))
             for j, val in enumerate(vals, 1):
                 enc = (val + acc + i + j) % MOD
