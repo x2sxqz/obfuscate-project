@@ -1138,7 +1138,30 @@ def _handler_bodies(_seed, pk, vmrun):
 _B64_STD = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 
 
-def _build_runtime(vmrun, pk, decode, empty, dispatch, skip_nums, seed, b64_alpha, gate=""):
+def _dispatch_tree(entries, bodies, junk, indent="    "):
+    """Build a balanced binary-search if/elseif tree over entries (sorted by
+    opcode number), instead of a flat linear elseif chain. Average-case
+    compares per dispatch drop from O(n) to O(log n)."""
+    if not entries:
+        return f"{indent}do end"
+    if len(entries) == 1:
+        name, num = entries[0]
+        lines = junk[num % len(junk)] if name is None else "\n".join(
+            f"{indent}  {ln}" for ln in bodies[name])
+        return f"{indent}if op == {num} then\n{lines}\n{indent}end"
+    mid = len(entries) // 2
+    _, pivot = entries[mid]
+    left = _dispatch_tree(entries[:mid], bodies, junk, indent + "  ")
+    right = _dispatch_tree(entries[mid:], bodies, junk, indent + "  ")
+    return (
+        f"{indent}if op < {pivot} then\n{left}\n"
+        f"{indent}else\n{right}\n"
+        f"{indent}end"
+    )
+
+
+def _build_runtime(vmrun, pk, decode, empty, dispatch, skip_nums, seed, b64_alpha,
+                    mod_d, mod_r, gate=""):
     """Generate the Lua source of the VM interpreter for this build.
 
     b64_alpha: this build's (shuffled) 64-character base64 alphabet, so the
@@ -1170,16 +1193,15 @@ def _build_runtime(vmrun, pk, decode, empty, dispatch, skip_nums, seed, b64_alph
     # referenced from outside the runtime, so they need not be reserved.
     b64a, b64l = "_B64A", "_B64L"
     _junk = ("ST[SP]=ST[SP]", "MC=MC", "R[NP]=R[NP]", "pc=pc+0", "SP=SP+0")
-    branches = []
-    for i, (name, num) in enumerate(dispatch):
-        kw = "if" if i == 0 else "elseif"
-        if name is None:  # bogus decoy handler, never emitted into any bytecode
-            lines = _junk[num % len(_junk)]
-        else:
-            lines = "\n      ".join(bodies[name])
-        branches.append(f"    {kw} op == {num} then\n      {lines}")
-    dispatch = "\n".join(branches) + "\n    end"
-    skip = " and ".join(f"op ~= {num}" for num in skip_nums)
+    # Balanced binary-search dispatch tree: O(log n) compares per instruction
+    # instead of a linear elseif scan (n = ~100-150 opcode branches incl.
+    # bogus decoys), a real win on hot loops in large scripts.
+    dispatch_code = _dispatch_tree(dispatch, bodies, _junk, indent="    ")
+    # O(1) "did this instruction already set pc" test: pc-setting opcodes were
+    # drawn from one residue class mod mod_d, everything else from the other,
+    # so a single modulo+compare replaces an AND-chain over every pc-setting
+    # opcode's aliases.
+    skip = f"op % {mod_d} ~= {mod_r}"
     return (
         f"local {pk} = function(...) return {{n = select('#', ...), ...}} end\n"
         # Shared empty table (n=0) reused for empty varargs / empty upvalue and
@@ -1254,7 +1276,7 @@ def _build_runtime(vmrun, pk, decode, empty, dispatch, skip_nums, seed, b64_alph
         f"  while true do\n"
         f"    local I = CODE[pc]\n"
         f"    local op = I[1]\n"
-        f"{dispatch}\n"
+        f"{dispatch_code}\n"
         f"    if {skip} then pc = pc + 1 end\n"
         f"  end\n"
         f"end\n"
@@ -1298,20 +1320,54 @@ class VmPass:
         # devirtualizer for one build can't assume opcode N always means op X).
         # A handful of bogus opcodes get decoy handlers that are never emitted,
         # padding the dispatch with dead branches. Branch order is shuffled.
-        pool = random.sample(range(1, 1_000_000), len(_OPCODES) * 3 + 10)
-        pi = 0
+        #
+        # Numbers are drawn from two residue classes mod a random small
+        # modulus (PC-setting opcodes from one residue, everything else from
+        # the other). This buys a real per-instruction speedup: the trailing
+        # "did this instruction already set pc" test collapses from an
+        # AND-chain of equality checks (one per pc-setting opcode alias) to a
+        # single `op % D ~= R` — O(1) instead of O(|_PC_SETTING| * aliases)
+        # — while the residue split itself still varies every build, so it
+        # adds no fixed fingerprint.
+        self._mod_d = random.randint(5, 11)
+        self._mod_r = random.randint(0, self._mod_d - 1)
+
+        def _residue_sample(count, want_match):
+            vals, seen = [], set()
+            while len(vals) < count:
+                v = random.randint(1, 999_999)
+                if v in seen:
+                    continue
+                if (v % self._mod_d == self._mod_r) != want_match:
+                    continue
+                seen.add(v)
+                vals.append(v)
+            return vals
+
+        pc_slots = sum(3 for n in _OPCODES if n in _PC_SETTING)  # worst case
+        other_slots = sum(3 for n in _OPCODES if n not in _PC_SETTING)
+        pc_pool = _residue_sample(pc_slots, True)
+        other_pool = _residue_sample(other_slots + 10, False)
+        ppi = opi = 0
         self.op_numbers = {}  # name -> [num, ...] (first is canonical)
         for name in _OPCODES:
             k = random.choice((1, 1, 2, 2, 3))
-            self.op_numbers[name] = pool[pi:pi + k]
-            pi += k
-        self.bogus_nums = pool[pi:pi + random.randint(3, 8)]
+            if name in _PC_SETTING:
+                self.op_numbers[name] = pc_pool[ppi:ppi + k]
+                ppi += k
+            else:
+                self.op_numbers[name] = other_pool[opi:opi + k]
+                opi += k
+        self.bogus_nums = other_pool[opi:opi + random.randint(3, 8)]
         # op_map keeps a single representative per name (for _PC_SETTING etc.)
         self.op_map = {name: nums[0] for name, nums in self.op_numbers.items()}
-        # dispatch entries: every (name, num) plus bogus, in shuffled order
+        # dispatch entries, ordered by number (enables a binary-search
+        # dispatch tree instead of a linear elseif scan — O(log n) compares
+        # per instruction instead of O(n) for VMs with 100+ opcode branches).
         self.dispatch = [(name, num) for name, nums in self.op_numbers.items() for num in nums]
         self.dispatch += [(None, b) for b in self.bogus_nums]
-        random.shuffle(self.dispatch)
+        random.shuffle(self.dispatch)  # shuffle first so ties/ordering stay unpredictable
+        self.dispatch.sort(key=lambda t: t[1])
         # Per-build seed for the rolling bytecode cipher (see _encode_code).
         self.seed = random.randint(1, 16777215)  # fits the 24-bit rolling cipher
         self.decode_name = _random_name()
@@ -1326,12 +1382,9 @@ class VmPass:
         chunk.body = self.visit_block(chunk.body, Scope(None))
         if self.used:
             gate = _env_gate() if self.anti_sandbox else ""
-            # Every number that any pc-setting opcode can appear as must be in
-            # the trailing-increment skip test.
-            skip_nums = [num for n in _PC_SETTING for num in self.op_numbers[n]]
             runtime_src = _build_runtime(self.vmrun_name, self.pk_name, self.decode_name,
-                                         self.empty_name, self.dispatch, skip_nums, self.seed,
-                                         self.b64_alpha, gate=gate)
+                                         self.empty_name, self.dispatch, None, self.seed,
+                                         self.b64_alpha, self._mod_d, self._mod_r, gate=gate)
             header = parse(runtime_src).body
             # Harden the interpreter: rename its readable internals (R, ST, op,
             # pc, handlers' temporaries, ...) so the dispatch no longer spells
